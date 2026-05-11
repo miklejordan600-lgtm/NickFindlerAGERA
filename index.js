@@ -2,7 +2,6 @@ import fs from "fs";
 import mineflayer from "mineflayer";
 import { Telegraf, Markup } from "telegraf";
 import { resolveSrv } from "dns/promises";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import http from "http";
 
 /* ================== ENV ================== */
@@ -14,18 +13,35 @@ const MC_PORT = Number(process.env.MC_PORT || 25565);
 const MC_USER = process.env.MC_USER;
 const MC_VERSION = process.env.MC_VERSION || "1.8.9";
 
+if (!BOT_TOKEN || !MC_HOST || !MC_USER) {
+  throw new Error("Missing ENV: BOT_TOKEN / MC_HOST / MC_USER");
+}
+
 /* ================== BOT ================== */
 const tg = new Telegraf(BOT_TOKEN);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ================== STATE ================== */
 let mc = null;
+let mcOnline = false;
 let mcReady = false;
 let tabReady = false;
-let mcOnline = false;
 let connecting = false;
 
-/* ================== CONNECT ================== */
+/* ================== SAFE RECONNECT ================== */
+let reconnectTimer = null;
+
+function scheduleReconnect(reason) {
+  if (reconnectTimer) return;
+
+  console.log("[MC RECONNECT]", reason);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectMC();
+  }, 4000);
+}
+
+/* ================== MC CONNECT ================== */
 async function connectMC() {
   if (connecting) return;
   connecting = true;
@@ -37,9 +53,9 @@ async function connectMC() {
       mc = null;
     }
 
+    mcOnline = false;
     mcReady = false;
     tabReady = false;
-    mcOnline = false;
 
     mc = mineflayer.createBot({
       host: MC_HOST,
@@ -54,14 +70,15 @@ async function connectMC() {
     });
 
     mc.on("spawn", async () => {
-      await sleep(1200);
-      mcReady = true;
-      tabReady = true;
-      console.log("[MC] READY");
+      setTimeout(() => {
+        mcReady = true;
+        tabReady = true;
+        console.log("[MC] READY");
+      }, 1200);
     });
 
     mc.on("end", () => scheduleReconnect("end"));
-    mc.on("kicked", () => scheduleReconnect("kicked"));
+    mc.on("kicked", (r) => scheduleReconnect("kicked"));
     mc.on("error", (e) => scheduleReconnect(e.message));
 
   } finally {
@@ -69,33 +86,30 @@ async function connectMC() {
   }
 }
 
-/* ================== TAB COMPLETE (FAST) ================== */
+/* ================== FAST TAB ================== */
 function tabComplete(bot, text) {
   return new Promise((res, rej) => {
     const c = bot?._client;
-    if (!c) return rej(new Error("NO_CLIENT"));
+    if (!c) return rej("NO_CLIENT");
 
-    const to = setTimeout(() => {
+    const timeout = setTimeout(() => {
       cleanup();
-      rej(new Error("TAB_TIMEOUT"));
-    }, 1200); // ⚡ ускорено с 2500 → 1200
+      rej("TAB_TIMEOUT");
+    }, 1200);
 
     function on(p) {
       cleanup();
-      const matches =
-        p?.matches?.map(x => (typeof x === "string" ? x : x.text || "")) || [];
+      const matches = p?.matches?.map(x => x?.text || x || "") || [];
       res(matches);
     }
 
     function cleanup() {
-      clearTimeout(to);
+      clearTimeout(timeout);
       try { c.removeListener("tab_complete", on); } catch {}
-      try { c.removeListener("tab_complete_response", on); } catch {}
     }
 
     try {
       c.once("tab_complete", on);
-      c.once("tab_complete_response", on);
 
       c.write("tab_complete", {
         text,
@@ -109,41 +123,38 @@ function tabComplete(bot, text) {
   });
 }
 
-/* ================== FAST PREFIX SCAN ================== */
+/* ================== FAST SCAN ================== */
 function clean(s) {
   return String(s).replace(/[^A-Za-z0-9_]/g, "");
 }
 
 async function byPrefix(prefix) {
   const raw = await tabComplete(mc, `/msg ${prefix}`);
-  const pref = clean(prefix).toLowerCase();
 
   return [...new Set(
     raw
       .map(clean)
       .filter(n => n.length >= 3 && n.length <= 16)
-      .filter(n => !pref || n.toLowerCase().startsWith(pref))
   )];
 }
 
-/* ================== 🔥 FAST COLLECT (×2–×4 SPEEDUP) ================== */
+/* ================== 🔥 ULTRA FAST COLLECT ================== */
 async function collect(ps) {
   const all = new Set();
 
   let ok = 0;
   let fail = 0;
 
-  const CONCURRENCY = 5; // ⚡ ключ ускорения
+  const CONCURRENCY = 5;
   let index = 0;
 
   async function worker() {
     while (index < ps.length) {
-      const i = index++;
-      const p = ps[i];
+      const p = ps[index++];
 
       try {
-        const found = await byPrefix(p);
-        found.forEach(n => all.add(n));
+        const res = await byPrefix(p);
+        res.forEach(n => all.add(n));
         ok++;
       } catch {
         fail++;
@@ -162,50 +173,60 @@ async function collect(ps) {
 
 /* ================== PREFIXES ================== */
 function prefixes() {
-  return [
-    ..."abcdefghijklmnopqrstuvwxyz0123456789_"
-  ];
+  return "abcdefghijklmnopqrstuvwxyz0123456789_".split("");
 }
 
-/* ================== AUTO RECONNECT ================== */
-let reconnectTimer = null;
+/* ================== BOT COMMANDS ================== */
+tg.start((ctx) => ctx.reply("✅ Bot online"));
 
-function scheduleReconnect(reason) {
-  if (reconnectTimer) return;
-
-  console.log("[MC] reconnect:", reason);
-
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectMC();
-  }, 4000);
-}
-
-/* ================== AUTO START ================== */
-(async () => {
-  console.log("[SYSTEM] start");
-
-  await connectMC();
-
-  http.createServer((req, res) => res.end("OK"))
-    .listen(process.env.PORT || 3000);
-
-  console.log("[SYSTEM] ready");
-})();
-
-/* ================== BASIC BOT ================== */
-tg.start((ctx) => ctx.reply("Bot online"));
+tg.command("status", (ctx) => {
+  ctx.reply(
+    `MC: ${mcOnline}\nREADY: ${mcReady}\nTAB: ${tabReady}`
+  );
+});
 
 tg.command("scan", async (ctx) => {
   if (!mcReady || !tabReady) return ctx.reply("MC not ready");
 
-  await ctx.reply("Scanning...");
+  await ctx.reply("🔎 scanning...");
 
   const scan = await collect(prefixes());
 
   await ctx.reply(
-    `Done\nNames: ${scan.names.length}\nOK: ${scan.okPrefixes}\nFAIL: ${scan.failedPrefixes}`
+    `DONE\nNames: ${scan.names.length}\nOK: ${scan.okPrefixes}\nFAIL: ${scan.failedPrefixes}`
   );
 });
 
-tg.launch();
+/* ================== SELF HEAL ================== */
+function selfHeal() {
+  process.on("uncaughtException", (e) => {
+    console.log("[CRASH]", e);
+  });
+
+  process.on("unhandledRejection", (e) => {
+    console.log("[PROMISE ERROR]", e);
+  });
+
+  setInterval(() => {
+    if (!mcOnline || !mcReady) {
+      console.log("[WATCHDOG] MC reconnect");
+      connectMC();
+    }
+  }, 30000);
+}
+
+/* ================== START ================== */
+(async () => {
+  console.log("[SYSTEM] starting...");
+
+  selfHeal();
+
+  await connectMC();
+
+  tg.launch();
+  console.log("[SYSTEM] Telegram started");
+
+  http.createServer((req, res) => res.end("OK"))
+    .listen(process.env.PORT || 3000);
+
+})();
