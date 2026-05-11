@@ -1,116 +1,133 @@
 import fs from "fs";
 import fsPromises from "fs/promises";
 import mineflayer from "mineflayer";
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
+import { resolveSrv } from "dns/promises";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import http from "http";
 
-/* ================== CONFIG ================== */
+/* ================== CONFIG & ENV ================== */
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const MC_HOST = (process.env.MC_HOST || "").trim();
 const MC_USER = process.env.MC_USER;
-const MC_PASS = process.env.MC_PASSWORD; // ПАРОЛЬ ОТ АККАУНТА В ИГРЕ
-const MC_VERSION = process.env.MC_VERSION === "false" ? false : (process.env.MC_VERSION || false);
+const MC_PASS = process.env.MC_PASSWORD; 
+const MC_VERSION = process.env.MC_VERSION || "1.8.9";
 
-console.log("[INIT] Запуск системы...");
-
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.error("[FATAL] Проверь BOT_TOKEN и CHAT_ID!");
-  process.exit(1);
+if (!BOT_TOKEN || !CHAT_ID || !MC_HOST) {
+    console.error("[FATAL] Проверь переменные окружения: BOT_TOKEN, CHAT_ID, MC_HOST");
+    process.exit(1);
 }
 
-/* ================== TELEGRAM ================== */
+/* ================== TELEGRAM BOT ================== */
 const tg = new Telegraf(BOT_TOKEN);
 
 async function initTelegram() {
-  try {
-    // Удаляем вебхуки и запускаем чистый Polling
-    await tg.telegram.deleteWebhook({ drop_pending_updates: true });
-    tg.launch();
-    console.log("[TG] ✓ Запущен через Polling (сообщения должны приходить)");
-    
-    await tg.telegram.sendMessage(CHAT_ID, "🚀 <b>Бот запущен!</b> Ожидаю вход на сервер...", { parse_mode: "HTML" });
-  } catch (e) {
-    console.error("[TG ERROR]", e.message);
-  }
+    try {
+        await tg.telegram.deleteWebhook({ drop_pending_updates: true });
+        tg.launch();
+        console.log("[TG] ✓ Бот запущен (Polling)");
+        await tg.telegram.sendMessage(CHAT_ID, "🚀 <b>Система сканирования запущена!</b>", { parse_mode: "HTML" });
+    } catch (e) {
+        console.error("[TG ERROR]", e.message);
+    }
 }
 
-/* ================== RULES ================== */
+/* ================== RULES & NORMALIZE ================== */
 let RULES = { rules: [], review: [] };
 async function loadRules() {
-  try {
-    const data = await fsPromises.readFile("rules.json", "utf8");
-    RULES = JSON.parse(data);
-    console.log("[RULES] ✓ Загружены");
-  } catch (e) { console.log("[RULES] ⚠ Работу без правил"); }
+    try {
+        const data = await fsPromises.readFile("rules.json", "utf8");
+        RULES = JSON.parse(data);
+        console.log("[RULES] ✓ Правила загружены");
+    } catch (e) {
+        console.warn("[RULES] ⚠ Ошибка загрузки rules.json, использую пустые правила");
+    }
+}
+
+function norm(s = "") {
+    return String(s).toLowerCase().replace(/§./g, "").replace(/[^a-z0-9]/g, "");
 }
 
 function checkNick(name) {
-  const n = name.toLowerCase();
-  for (const rule of RULES.rules || []) {
-    for (const w of rule.words || []) {
-      if (n.includes(w.toLowerCase())) return ["BAN", rule.reason];
+    const n = norm(name);
+    for (const rule of RULES.rules || []) {
+        for (const w of rule.words || []) {
+            if (n.includes(norm(w))) return ["BAN", rule.reason || "Banned word"];
+        }
     }
-  }
-  return ["OK", null];
+    return ["OK", null];
 }
 
-/* ================== MINECRAFT ================== */
+/* ================== MINEFLAYER ENGINE ================== */
+let bot = null;
+let reconnectTimeout = null;
+
 function createMCBot() {
-  console.log(`[MC] Подключение к ${MC_HOST}...`);
-  
-  const bot = mineflayer.createBot({
-    host: MC_HOST,
-    username: MC_USER,
-    version: MC_VERSION,
-    hideErrors: true,
-    checkTimeoutInterval: 60000 // Увеличиваем время ожидания
-  });
-
-  bot.on("spawn", async () => {
-    console.log("[MC] ✓ Заспавнился!");
+    if (reconnectTimeout) clearTimeout(reconnectTimeout);
     
-    // АВТО-ЛОГИН: Если сервер требует пароль
-    if (MC_PASS) {
-      console.log("[MC] Отправляю команду авторизации...");
-      bot.chat(`/login ${MC_PASS}`);
+    // Очистка старого бота перед созданием нового
+    if (bot) {
+        bot.removeAllListeners();
+        try { bot.end(); } catch (e) {}
+        bot = null;
     }
+
+    console.log(`[MC] Подключение к ${MC_HOST}...`);
+
+    bot = mineflayer.createBot({
+        host: MC_HOST,
+        username: MC_USER,
+        version: MC_VERSION,
+        hideErrors: true,
+        checkTimeoutInterval: 60000
+    });
+
+    bot.setMaxListeners(30);
+
+    // Авторизация один раз при спавне
+    bot.once("spawn", () => {
+        console.log("[MC] ✓ Бот заспавнился");
+        if (MC_PASS) {
+            setTimeout(() => {
+                bot.chat(`/login ${MC_PASS}`);
+                console.log("[MC] Команда /login отправлена");
+            }, 2000);
+        }
+    });
+
+    // Обработка входа игроков
+    bot.on("playerJoined", async (player) => {
+        if (player.username === bot.username) return;
+        const [status, reason] = checkNick(player.username);
+        if (status === "BAN") {
+            const msg = `🚫 <b>Нарушитель!</b>\nНик: <code>${player.username}</code>\nПричина: ${reason}`;
+            await tg.telegram.sendMessage(CHAT_ID, msg, { parse_mode: "HTML" }).catch(() => {});
+        }
+    });
+
+    bot.on("error", (err) => console.log("[MC ERROR]", err.message));
     
-    await tg.telegram.sendMessage(CHAT_ID, "🎮 <b>Бот в игре!</b> Начинаю сканирование игроков.");
-  });
-
-  // Ловим сообщения сервера (например, "Введите пароль")
-  bot.on("messagestr", (message) => {
-    if (message.includes("авторизацию") || message.includes("/login")) {
-      console.log("[MC] Сервер просит логин...");
-      if (MC_PASS) bot.chat(`/login ${MC_PASS}`);
-    }
-  });
-
-  bot.on("playerJoined", async (player) => {
-    if (player.username === bot.username) return;
-    const [status, reason] = checkNick(player.username);
-    if (status === "BAN") {
-      await tg.telegram.sendMessage(CHAT_ID, `🚫 <b>Нарушитель!</b>\nНик: <code>${player.username}</code>\nПричина: ${reason}`, { parse_mode: "HTML" });
-    }
-  });
-
-  bot.on("error", (err) => console.log("[MC ERROR]", err.message));
-
-  bot.on("end", (reason) => {
-    console.log(`[MC] Отключен (${reason}). Реконнект через 15 сек...`);
-    setTimeout(createMCBot, 15000);
-  });
+    bot.on("end", (reason) => {
+        console.log(`[MC] Отключен: ${reason}. Реконнект через 15с...`);
+        reconnectTimeout = setTimeout(createMCBot, 15000);
+    });
 }
 
 /* ================== START ================== */
-loadRules().then(() => {
-  initTelegram();
-  createMCBot();
-});
+(async () => {
+    await loadRules();
+    await initTelegram();
+    createMCBot();
+})();
 
-// Заглушка сервера для Railway
+/* ================== KEEP ALIVE ================== */
+// HTTP сервер, чтобы Railway не считал приложение упавшим
 http.createServer((req, res) => {
-  res.writeHead(200, {'Content-Type': 'text/plain'});
-  res.end('Bot is alive');
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is running');
 }).listen(process.env.PORT || 3000);
+
+// Защита от фатальных ошибок
+process.on('uncaughtException', (e) => console.error('CRASH:', e));
+process.on('unhandledRejection', (e) => console.error('REJECTION:', e));
