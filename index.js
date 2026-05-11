@@ -1,47 +1,37 @@
 import fs from "fs";
 import mineflayer from "mineflayer";
-import { Telegraf, Markup } from "telegraf";
+import { Telegraf } from "telegraf";
 import { resolveSrv } from "dns/promises";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 /* ================== ENV ================== */
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-const PING_USER_ID = process.env.PING_USER_ID ? Number(process.env.PING_USER_ID) : null;
-
-const ALLOWED_USER_IDS = new Set(
-  String(process.env.ALLOWED_USER_IDS || process.env.PING_USER_ID || "")
-    .split(",")
-    .map((x) => Number(String(x).trim()))
-    .filter((x) => Number.isInteger(x) && x > 0)
-);
-
 const MC_HOST = (process.env.MC_HOST || "").trim();
 const MC_PORT = Number(process.env.MC_PORT || 25565);
 const MC_USER = process.env.MC_USER;
-
-const MC_VERSION =
-  process.env.MC_VERSION === "false"
-    ? false
-    : (process.env.MC_VERSION || false);
-
+const MC_VERSION = process.env.MC_VERSION === "false" ? false : (process.env.MC_VERSION || false);
 const MC_PASSWORD = process.env.MC_PASSWORD;
-
 const AUTO_SCAN = (process.env.AUTO_SCAN || "1") === "1";
 const AUTO_SCAN_MINUTES = Number(process.env.AUTO_SCAN_MINUTES || 10);
 const SCAN_DELAY_MS = Number(process.env.SCAN_DELAY_MS || 200);
 const AUTO_PREFIXES = (process.env.AUTO_PREFIXES || "").trim();
-
 const READY_AFTER_MS = Number(process.env.READY_AFTER_MS || 1500);
 const STARTUP_SCAN_DELAY_MS = Number(process.env.STARTUP_SCAN_DELAY_MS || 8000);
 const TAB_WARMUP_RETRIES = Number(process.env.TAB_WARMUP_RETRIES || 4);
 const TAB_WARMUP_DELAY_MS = Number(process.env.TAB_WARMUP_DELAY_MS || 2000);
-
 const DEBUG_MODE = (process.env.DEBUG_MODE || "0") === "1";
 const GEMINI_KEY = process.env.GEMINI_KEY;
 
+console.log("[INIT] Environment variables loaded");
+console.log("[INIT] BOT_TOKEN:", BOT_TOKEN ? "✓" : "✗");
+console.log("[INIT] MC_HOST:", MC_HOST || "✗");
+console.log("[INIT] MC_USER:", MC_USER || "✗");
+console.log("[INIT] CHAT_ID:", CHAT_ID || "✗");
+
 if (!BOT_TOKEN || !MC_HOST || !MC_USER) {
-  throw new Error("Нужны BOT_TOKEN, MC_HOST, MC_USER");
+  console.error("[FATAL] Missing: BOT_TOKEN, MC_HOST, or MC_USER");
+  process.exit(1);
 }
 
 /* ================== DEBUG ================== */
@@ -51,35 +41,38 @@ function debugLog(msg, data = null) {
   }
 }
 
-/* ================== TG ================== */
+/* ================== TELEGRAM ================== */
 const tg = new Telegraf(BOT_TOKEN);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 tg.catch((err) => {
-  console.log("TG ERROR:", err?.message || err);
+  console.error("[TG ERROR]", err?.message || err);
 });
 
 async function launchTelegramSafely() {
+  let attempts = 0;
   while (true) {
     try {
-      console.log("Telegram starting...");
+      attempts++;
+      console.log(`[TG] Launch attempt ${attempts}...`);
       await tg.launch({
         dropPendingUpdates: true,
         allowedUpdates: [],
       });
-      console.log("Telegram started");
+      console.log("[TG] ✓ Launched successfully");
       return;
     } catch (e) {
       const msg = String(e?.message || e);
+      console.error("[TG] Launch failed:", msg);
 
       if (msg.includes("409") || msg.includes("Conflict")) {
-        console.log("409 conflict, retry...");
+        console.log("[TG] 409 conflict, waiting 15s...");
         await sleep(15000);
         continue;
       }
 
-      console.log("TG launch error:", msg);
+      console.log("[TG] Retrying in 5s...");
       await sleep(5000);
     }
   }
@@ -91,9 +84,9 @@ function sendToTelegram(text, opts = {}) {
     tg.telegram.sendMessage(CHAT_ID, text, {
       parse_mode: "HTML",
       ...opts,
-    }).catch(e => debugLog("TG send error:", e?.message));
+    }).catch(e => console.error("[TG SEND]", e?.message));
   } catch (e) {
-    debugLog("TG send catch:", e?.message);
+    console.error("[TG SEND ERROR]", e?.message);
   }
 }
 
@@ -102,15 +95,14 @@ let geminiClient = null;
 if (GEMINI_KEY) {
   try {
     geminiClient = new GoogleGenerativeAI(GEMINI_KEY);
-    console.log("[GEMINI] initialized");
+    console.log("[GEMINI] ✓ Initialized");
   } catch (e) {
-    console.log("[GEMINI] init error:", e?.message);
+    console.error("[GEMINI] Init failed:", e?.message);
   }
 }
 
 async function checkNickWithAI(nick) {
   if (!geminiClient) return null;
-  
   try {
     const model = geminiClient.getGenerativeModel({ model: "gemini-pro" });
     const prompt = `Analyze if this Minecraft nickname contains banned content (profanity, cheats, racism, extremism, drugs, body/sex references, insults, impersonation): "${nick}". Respond with JSON: {"suspicious": boolean, "reason": "text"}`;
@@ -130,15 +122,19 @@ async function checkNickWithAI(nick) {
 }
 
 /* ================== RULES ================== */
-let RULES = JSON.parse(fs.readFileSync("rules.json", "utf8"));
-
-function reloadRules() {
+let RULES = {};
+function loadRules() {
   try {
     RULES = JSON.parse(fs.readFileSync("rules.json", "utf8"));
-    console.log("[RULES] reloaded");
+    console.log("[RULES] ✓ Loaded");
   } catch (e) {
-    console.log("[RULES] reload error:", e?.message);
+    console.error("[RULES] Load failed:", e?.message);
+    RULES = { rules: [], review: [] };
   }
+}
+
+function reloadRules() {
+  loadRules();
 }
 
 /* ================== NORMALIZE ================== */
@@ -155,7 +151,6 @@ function checkNick(name) {
 
   for (const rule of RULES.rules || []) {
     if ((rule.action || "").toUpperCase() !== "BAN") continue;
-
     for (const w of rule.words || []) {
       if (n.includes(norm(w))) {
         return ["BAN", [`${rule.reason || rule.id}:${w}`]];
@@ -175,26 +170,14 @@ function checkNick(name) {
 /* ================== SRV ================== */
 async function resolveMcEndpoint(host, port) {
   const h = String(host || "").trim();
-
   try {
     const srv = await resolveSrv(`_minecraft._tcp.${h}`);
-
     if (srv?.length) {
       srv.sort((a, b) => a.priority - b.priority);
-
-      return {
-        host: srv[0].name,
-        port: srv[0].port,
-        via: "SRV",
-      };
+      return { host: srv[0].name, port: srv[0].port, via: "SRV" };
     }
   } catch {}
-
-  return {
-    host: h,
-    port: Number(port || 25565),
-    via: "DIRECT",
-  };
+  return { host: h, port: Number(port || 25565), via: "DIRECT" };
 }
 
 /* ================== MC STATE ================== */
@@ -221,63 +204,46 @@ function addTimer(timer) {
 
 function clearAllTimers() {
   for (const timer of pendingTimers) {
-    try {
-      clearTimeout(timer);
-      clearInterval(timer);
-    } catch {}
+    try { clearTimeout(timer); clearInterval(timer); } catch {}
   }
   pendingTimers.clear();
 }
 
 function addListener(obj, event, handler) {
   pendingListeners.push({ obj, event, handler });
-  return { obj, event, handler };
 }
 
 function clearAllListeners() {
   for (const { obj, event, handler } of pendingListeners) {
-    try {
-      obj.removeListener(event, handler);
-    } catch {}
+    try { obj.removeListener(event, handler); } catch {}
   }
   pendingListeners.length = 0;
 }
 
 function scheduleReconnect(reason) {
   if (reconnectTimer) return;
-
-  console.log("[MC] reconnect scheduled:", reason);
-
+  console.log("[MC] Reconnect scheduled:", reason);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectMC();
   }, 5000);
-  
   addTimer(reconnectTimer);
 }
 
 function startHeartbeat() {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
-  
   heartbeatTimer = setInterval(() => {
     lastHeartbeat = Date.now();
-    
-    if (mcReady && tabReady && mc && mc.health !== undefined) {
-      debugLog("Heartbeat OK", { health: mc.health, position: mc.player?.position });
-    } else if (mcOnline && (!mcReady || !tabReady)) {
-      console.log("[HEARTBEAT] WARNING: online but not ready");
+    if (mcOnline && (!mcReady || !tabReady)) {
+      console.log("[HEARTBEAT] Online but not ready, reconnecting...");
       scheduleReconnect("heartbeat_not_ready");
     }
   }, 15000);
-  
   addTimer(heartbeatTimer);
 }
 
 function stopHeartbeat() {
-  if (heartbeatTimer) {
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
-  }
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
 }
 
 function tabComplete(bot, text) {
@@ -298,41 +264,23 @@ function tabComplete(bot, text) {
     const on = (p) => {
       cleanup();
       tabCompleteFailures = 0;
-
-      const matches =
-        p?.matches?.map((x) =>
-          typeof x === "string"
-            ? x
-            : x.text || x.match || ""
-        ) || [];
-
+      const matches = p?.matches?.map((x) => typeof x === "string" ? x : x.text || x.match || "") || [];
       res(matches);
     };
 
     function cleanup() {
       clearTimeout(timeout);
-
-      try {
-        c.removeListener("tab_complete", on);
-      } catch {}
-
-      try {
-        c.removeListener("tab_complete_response", on);
-      } catch {}
+      try { c.removeListener("tab_complete", on); } catch {}
+      try { c.removeListener("tab_complete_response", on); } catch {}
     }
 
     try {
       c.once("tab_complete", on);
       c.once("tab_complete_response", on);
-
       c.write("tab_complete", {
         text,
         assumeCommand: true,
-        lookedAtBlock: {
-          x: 0,
-          y: 0,
-          z: 0,
-        },
+        lookedAtBlock: { x: 0, y: 0, z: 0 },
       });
     } catch (e) {
       cleanup();
@@ -349,20 +297,14 @@ async function processTabCompleteQueue() {
   try {
     while (tabCompleteQueue.length > 0) {
       const { prefix, resolve, reject } = tabCompleteQueue.shift();
-
       try {
-        if (!mcReady || !tabReady) {
-          throw new Error("MC_NOT_READY");
-        }
-
+        if (!mcReady || !tabReady) throw new Error("MC_NOT_READY");
         const raw = await tabComplete(mc, `/msg ${prefix}`);
         resolve(raw);
-        
         lastTabCompleteTime = Date.now();
       } catch (e) {
         reject(e);
       }
-
       await sleep(SCAN_DELAY_MS);
     }
   } finally {
@@ -370,55 +312,39 @@ async function processTabCompleteQueue() {
   }
 }
 
-function byPrefixQueued(prefix) {
+async function byPrefix(prefix) {
+  if (!mcReady || !tabReady) throw new Error("MC_NOT_READY");
+  
   return new Promise((resolve, reject) => {
-    tabCompleteQueue.push({ prefix, resolve, reject });
+    tabCompleteQueue.push({ 
+      prefix, 
+      resolve: (raw) => {
+        const clean = (s) => String(s).replace(/[^A-Za-z0-9_]/g, "");
+        resolve([...new Set(raw.map(clean).filter((x) => x.length >= 3 && x.length <= 16))]);
+      },
+      reject 
+    });
     processTabCompleteQueue();
   });
-}
-
-async function byPrefix(prefix) {
-  if (!mcReady || !tabReady) {
-    throw new Error("MC_NOT_READY");
-  }
-
-  const raw = await tabComplete(mc, `/msg ${prefix}`);
-
-  function clean(s) {
-    return String(s).replace(/[^A-Za-z0-9_]/g, "");
-  }
-
-  return [
-    ...new Set(
-      raw
-        .map(clean)
-        .filter((x) => x.length >= 3 && x.length <= 16)
-    ),
-  ];
 }
 
 async function warmupTabReady(bot) {
   for (let i = 1; i <= TAB_WARMUP_RETRIES; i++) {
     try {
       const r = await tabComplete(bot, "/msg a");
-
       if (Array.isArray(r)) {
         tabReady = true;
         mcReady = true;
         loginAttempted = false;
         lastTabCompleteTime = Date.now();
-
         console.log(`[MC] TAB ready on try ${i}`);
-
         return true;
       }
     } catch (e) {
-      console.log(`[MC] TAB warmup fail ${i}`, e?.message || e);
-
+      console.log(`[MC] TAB warmup fail ${i}:`, e?.message);
       await sleep(TAB_WARMUP_DELAY_MS);
     }
   }
-
   tabCompleteFailures++;
   return false;
 }
@@ -428,19 +354,12 @@ async function connectMC() {
     debugLog("Connect already in progress");
     return;
   }
-
   connecting = true;
 
   try {
     if (mc) {
-      try {
-        mc.quit("reconnect");
-      } catch {}
-
-      try {
-        mc.end();
-      } catch {}
-
+      try { mc.quit("reconnect"); } catch {}
+      try { mc.end(); } catch {}
       clearAllListeners();
       mc = null;
     }
@@ -452,16 +371,7 @@ async function connectMC() {
     tabCompleteFailures = 0;
 
     const ep = await resolveMcEndpoint(MC_HOST, MC_PORT);
-
-    console.log("[MC DEBUG]", {
-      inputHost: MC_HOST,
-      inputPort: MC_PORT,
-      resolvedHost: ep.host,
-      resolvedPort: ep.port,
-      via: ep.via,
-      version: MC_VERSION,
-      user: MC_USER,
-    });
+    console.log("[MC] Connecting to", ep.host + ":" + ep.port, "(" + ep.via + ")");
 
     mc = mineflayer.createBot({
       host: ep.host,
@@ -473,87 +383,66 @@ async function connectMC() {
       checkTimeoutInterval: 30000,
       viewDistance: "tiny",
       skipValidation: true,
-      validateMinecraftVersions: false,
     });
 
     const loginHandler = () => {
       mcOnline = true;
-      console.log("[MC] login");
+      console.log("[MC] ✓ Login");
       startHeartbeat();
     };
 
     const spawnHandler = async () => {
-      console.log("[MC] spawn");
-
+      console.log("[MC] ✓ Spawn");
       await sleep(READY_AFTER_MS);
-
       const ok = await warmupTabReady(mc);
-
       if (!ok) {
         console.log("[MC] TAB failed after spawn");
         scheduleReconnect("tab_failed_spawn");
-        return;
+      } else {
+        console.log("[MC] ✓ READY");
+        lastAutoScanTime = Date.now();
       }
-
-      console.log("[MC] READY - starting auto scan");
-      lastAutoScanTime = Date.now();
     };
 
     const messageHandler = (msg) => {
       const m = String(msg).toLowerCase();
-
       if (MC_PASSWORD && m.includes("login") && !loginAttempted) {
         loginAttempted = true;
         const t = setTimeout(() => {
-          try {
-            mc.chat(`/login ${MC_PASSWORD}`);
-          } catch {}
+          try { mc.chat(`/login ${MC_PASSWORD}`); } catch {}
         }, 1500);
         addTimer(t);
       }
-
       if (MC_PASSWORD && m.includes("register") && !loginAttempted) {
         loginAttempted = true;
         const t = setTimeout(() => {
-          try {
-            mc.chat(`/register ${MC_PASSWORD} ${MC_PASSWORD}`);
-          } catch {}
+          try { mc.chat(`/register ${MC_PASSWORD} ${MC_PASSWORD}`); } catch {}
         }, 1500);
         addTimer(t);
       }
-
       if (m.includes("antibot") || m.includes("limbo")) {
-        console.log("[MC] detected antibot/limbo, reconnecting");
+        console.log("[MC] Detected antibot/limbo");
         scheduleReconnect("antibot_limbo");
       }
     };
 
     const kickedHandler = (r) => {
-      console.log("[MC] kicked:", r);
+      console.log("[MC] Kicked:", r);
       scheduleReconnect("kicked");
     };
 
     const endHandler = () => {
-      console.log("[MC] disconnected");
+      console.log("[MC] Disconnected");
       stopHeartbeat();
       scheduleReconnect("end");
     };
 
     const errorHandler = (e) => {
-      console.log("[MC ERROR]", e?.stack || e?.message || e);
-      
-      if (String(e?.message || e).includes("ECONNREFUSED") || 
-          String(e?.message || e).includes("ETIMEDOUT")) {
+      console.error("[MC ERROR]", e?.message || e);
+      if (String(e?.message).includes("ECONNREFUSED") || String(e?.message).includes("ETIMEDOUT")) {
         scheduleReconnect("connection_error");
       }
     };
-
-    addListener(mc, "login", loginHandler);
-    addListener(mc, "spawn", spawnHandler);
-    addListener(mc, "messagestr", messageHandler);
-    addListener(mc, "kicked", kickedHandler);
-    addListener(mc, "end", endHandler);
-    addListener(mc, "error", errorHandler);
 
     mc.on("login", loginHandler);
     mc.on("spawn", spawnHandler);
@@ -561,9 +450,15 @@ async function connectMC() {
     mc.on("kicked", kickedHandler);
     mc.on("end", endHandler);
     mc.on("error", errorHandler);
+    addListener(mc, "login", loginHandler);
+    addListener(mc, "spawn", spawnHandler);
+    addListener(mc, "messagestr", messageHandler);
+    addListener(mc, "kicked", kickedHandler);
+    addListener(mc, "end", endHandler);
+    addListener(mc, "error", errorHandler);
 
   } catch (e) {
-    console.log("[MC CONNECT ERROR]", e?.message || e);
+    console.error("[MC CONNECT ERROR]", e?.message || e);
     stopHeartbeat();
     scheduleReconnect("connect_error");
   } finally {
@@ -573,47 +468,35 @@ async function connectMC() {
 
 /* ================== AUTO SCAN ================== */
 async function performAutoScan() {
-  if (!AUTO_SCAN || !mcReady || !tabReady) {
-    return;
-  }
+  if (!AUTO_SCAN || !mcReady || !tabReady) return;
 
   try {
-    console.log("[AUTO SCAN] starting");
-
-    const prefixes = AUTO_PREFIXES
-      ? AUTO_PREFIXES.split(",").map(p => p.trim()).filter(p => p)
-      : ["a", "b", "c"];
-
+    console.log("[AUTO SCAN] Starting");
+    const prefixes = AUTO_PREFIXES ? AUTO_PREFIXES.split(",").map(p => p.trim()).filter(p => p) : ["a", "b", "c"];
     const allNicks = [];
 
     for (const prefix of prefixes) {
       try {
-        const names = await byPrefixQueued(prefix);
+        const names = await byPrefix(prefix);
         allNicks.push(...names);
-        debugLog(`Auto scan prefix ${prefix}:`, names.length);
+        debugLog(`Prefix ${prefix}:`, names.length);
       } catch (e) {
-        console.log(`[AUTO SCAN] prefix ${prefix} error:`, e?.message);
+        console.error(`[AUTO SCAN] Prefix ${prefix}:`, e?.message);
       }
-
       await sleep(SCAN_DELAY_MS);
     }
 
     const unique = [...new Set(allNicks)];
-
-    let banCount = 0;
-    let reviewCount = 0;
-    let results = [];
+    let banCount = 0, reviewCount = 0, results = [];
 
     for (const nick of unique) {
       const [status, reasons] = checkNick(nick);
-
       if (status === "BAN") {
         banCount++;
         results.push({ nick, status, reasons });
       } else if (status === "REVIEW") {
         reviewCount++;
         results.push({ nick, status, reasons });
-
         if (geminiClient) {
           const aiResult = await checkNickWithAI(nick);
           if (aiResult?.suspicious) {
@@ -623,14 +506,7 @@ async function performAutoScan() {
       }
     }
 
-    const html = [
-      `<b>🔎 Auto Scan Report</b>`,
-      `Scanned: ${unique.length}`,
-      `Ban: ${banCount}`,
-      `Review: ${reviewCount}`,
-      ``,
-    ];
-
+    const html = [`<b>🔎 Auto Scan Report</b>`, `Scanned: ${unique.length}`, `Ban: ${banCount}`, `Review: ${reviewCount}`, ``];
     if (banCount > 0) {
       html.push(`<b>🚫 BAN LIST:</b>`);
       for (const { nick, reasons } of results.filter(r => r.status === "BAN")) {
@@ -638,7 +514,6 @@ async function performAutoScan() {
       }
       html.push(``);
     }
-
     if (reviewCount > 0) {
       html.push(`<b>⚠️ REVIEW LIST:</b>`);
       for (const { nick, reasons, aiReason } of results.filter(r => r.status === "REVIEW")) {
@@ -647,53 +522,30 @@ async function performAutoScan() {
       }
     }
 
-    if (html.length > 5) {
-      sendToTelegram(html.join("\n"));
-    }
-
+    if (html.length > 5) sendToTelegram(html.join("\n"));
     lastAutoScanTime = Date.now();
-    console.log("[AUTO SCAN] completed:", { unique: unique.length, ban: banCount, review: reviewCount });
+    console.log(`[AUTO SCAN] Complete: ${unique.length} scanned, ${banCount} ban, ${reviewCount} review`);
   } catch (e) {
-    console.log("[AUTO SCAN] error:", e?.message || e);
+    console.error("[AUTO SCAN] Error:", e?.message);
   }
 }
 
-/* ================== COMMANDS ================== */
+/* ================== TELEGRAM COMMANDS ================== */
 tg.start((ctx) => {
-  ctx.reply(
-    [
-      "🚀 Bot started",
-      "",
-      "/tab <prefix> - manual scan",
-      "/status - show status",
-      "/reload - reload rules",
-      "/scan - force auto scan",
-    ].join("\n")
-  );
+  ctx.reply("🚀 Bot started\n\n/tab <prefix> - manual scan\n/status - show status\n/reload - reload rules\n/scan - force auto scan");
 });
 
 tg.command("status", (ctx) => {
   const now = Date.now();
-  const lastScanAgo = Math.round((now - lastAutoScanTime) / 1000);
-  const lastTabAgo = Math.round((now - lastTabCompleteTime) / 1000);
-  
-  ctx.reply(
-    [
-      `<b>Status Report</b>`,
-      ``,
-      `MC Online: ${mcOnline ? "✅" : "❌"}`,
-      `MC Ready: ${mcReady ? "✅" : "❌"}`,
-      `TAB Ready: ${tabReady ? "✅" : "❌"}`,
-      `Connecting: ${connecting ? "⏳" : "✅"}`,
-      ``,
-      `Version: ${MC_VERSION || "auto"}`,
-      `Tab failures: ${tabCompleteFailures}`,
-      `Last scan: ${lastScanAgo}s ago`,
-      `Last tab: ${lastTabAgo}s ago`,
-      `Queue length: ${tabCompleteQueue.length}`,
-    ].join("\n"),
-    { parse_mode: "HTML" }
-  );
+  ctx.reply([
+    `<b>Status Report</b>`,
+    `MC Online: ${mcOnline ? "✅" : "❌"}`,
+    `MC Ready: ${mcReady ? "✅" : "❌"}`,
+    `TAB Ready: ${tabReady ? "✅" : "❌"}`,
+    `Tab failures: ${tabCompleteFailures}`,
+    `Last scan: ${Math.round((now - lastAutoScanTime) / 1000)}s ago`,
+    `Queue: ${tabCompleteQueue.length}`,
+  ].join("\n"), { parse_mode: "HTML" });
 });
 
 tg.command("reload", (ctx) => {
@@ -706,7 +558,6 @@ tg.command("scan", async (ctx) => {
     ctx.reply("❌ MC not ready");
     return;
   }
-
   ctx.reply("🔄 Scanning...");
   await performAutoScan();
   ctx.reply("✅ Scan completed");
@@ -715,21 +566,11 @@ tg.command("scan", async (ctx) => {
 tg.command("tab", async (ctx) => {
   try {
     const arg = ctx.message.text.split(" ").slice(1).join(" ");
-
-    if (!arg) {
-      ctx.reply("Usage: /tab <prefix>");
-      return;
-    }
-
-    if (!mcReady || !tabReady) {
-      ctx.reply("❌ MC not ready");
-      return;
-    }
+    if (!arg) { ctx.reply("Usage: /tab <prefix>"); return; }
+    if (!mcReady || !tabReady) { ctx.reply("❌ MC not ready"); return; }
 
     const names = await byPrefix(arg);
-
     let out = `🔎 Tab scan: <b>${arg}</b>\n\n`;
-
     if (names.length === 0) {
       out += "No players found";
     } else {
@@ -737,20 +578,16 @@ tg.command("tab", async (ctx) => {
         const [s, reasons] = checkNick(n);
         const emoji = s === "BAN" ? "🚫" : s === "REVIEW" ? "⚠️" : "✅";
         out += `${emoji} <code>${n}</code> - ${s}\n`;
-
-        if (reasons.length > 0) {
-          out += `    ${reasons.join(" | ")}\n`;
-        }
+        if (reasons.length > 0) out += `    ${reasons.join(" | ")}\n`;
       }
     }
-
     ctx.reply(out, { parse_mode: "HTML" });
   } catch (e) {
     ctx.reply("❌ ERR: " + String(e?.message || e));
   }
 });
 
-tg.command("connect", async (ctx) => {
+tg.command("connect", (ctx) => {
   if (!connecting && !mcReady) {
     ctx.reply("🔄 Connecting...");
     connectMC();
@@ -761,109 +598,83 @@ tg.command("connect", async (ctx) => {
 
 /* ================== WATCHDOG ================== */
 function startWatchdog() {
-  const watchdogInterval = setInterval(() => {
+  const interval = setInterval(() => {
     const now = Date.now();
-
-    // Check if online but not ready
     if (mcOnline && (!mcReady || !tabReady) && !connecting) {
-      console.log("[WATCHDOG] online but not ready - reconnecting");
+      console.log("[WATCHDOG] Online but not ready");
       scheduleReconnect("watchdog_not_ready");
     }
-
-    // Check if tab_complete hasn't been used recently
-    if (mcReady && tabReady && (now - lastTabCompleteTime > 120000)) {
-      console.log("[WATCHDOG] tab_complete inactive for 2 minutes");
-      if (tabCompleteFailures > 5) {
-        scheduleReconnect("watchdog_tab_inactive");
-      }
+    if (mcReady && tabReady && (now - lastTabCompleteTime > 120000) && tabCompleteFailures > 5) {
+      console.log("[WATCHDOG] Tab inactive");
+      scheduleReconnect("watchdog_tab_inactive");
     }
-
-    // Check if auto scan hasn't run recently
     if (AUTO_SCAN && mcReady && tabReady && (now - lastAutoScanTime > (AUTO_SCAN_MINUTES * 60000 + 30000))) {
-      console.log("[WATCHDOG] auto scan overdue");
+      console.log("[WATCHDOG] Auto scan overdue");
       performAutoScan();
     }
-
-    // Check heartbeat
     if (mcOnline && (now - lastHeartbeat > 45000)) {
-      console.log("[WATCHDOG] heartbeat timeout");
+      console.log("[WATCHDOG] Heartbeat timeout");
       scheduleReconnect("watchdog_heartbeat");
     }
   }, 20000);
-
-  addTimer(watchdogInterval);
-  return watchdogInterval;
-}
-
-/* ================== STARTUP SEQUENCE ================== */
-async function startupSequence() {
-  console.log("[STARTUP] beginning startup sequence");
-  
-  try {
-    await launchTelegramSafely();
-    console.log("[STARTUP] telegram ready");
-  } catch (e) {
-    console.log("[STARTUP] telegram error:", e?.message);
-  }
-
-  await sleep(2000);
-
-  console.log("[STARTUP] connecting to minecraft");
-  connectMC();
-
-  await sleep(STARTUP_SCAN_DELAY_MS);
-
-  if (AUTO_SCAN && mcReady && tabReady) {
-    console.log("[STARTUP] performing initial auto scan");
-    await performAutoScan();
-  }
-
-  startWatchdog();
-
-  if (AUTO_SCAN && mcReady && tabReady) {
-    const autoScanInterval = setInterval(() => {
-      if (mcReady && tabReady && !connecting) {
-        performAutoScan();
-      }
-    }, AUTO_SCAN_MINUTES * 60000);
-
-    addTimer(autoScanInterval);
-  }
-
-  console.log("[STARTUP] sequence complete");
+  addTimer(interval);
 }
 
 /* ================== GRACEFUL SHUTDOWN ================== */
 async function gracefulShutdown() {
-  console.log("[SHUTDOWN] beginning graceful shutdown");
-
+  console.log("[SHUTDOWN] Starting graceful shutdown...");
   stopHeartbeat();
   clearAllTimers();
   clearAllListeners();
-
   if (mc) {
-    try {
-      mc.quit("shutdown");
-    } catch {}
-
-    try {
-      mc.end();
-    } catch {}
+    try { mc.quit("shutdown"); } catch {}
+    try { mc.end(); } catch {}
   }
-
-  try {
-    await tg.stop("shutdown");
-  } catch {}
-
-  console.log("[SHUTDOWN] complete");
+  try { await tg.stop("shutdown"); } catch {}
+  console.log("[SHUTDOWN] Complete");
   process.exit(0);
 }
 
-process.once("SIGINT", () => gracefulShutdown());
-process.once("SIGTERM", () => gracefulShutdown());
-
-/* ================== START ================== */
-startupSequence().catch(e => {
-  console.log("[STARTUP] fatal error:", e?.message || e);
-  process.exit(1);
+process.on("SIGINT", () => gracefulShutdown());
+process.on("SIGTERM", () => gracefulShutdown());
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT EXCEPTION]", err);
+  gracefulShutdown();
 });
+
+/* ================== MAIN STARTUP ================== */
+async function main() {
+  try {
+    console.log("[MAIN] Starting main sequence...");
+    loadRules();
+    
+    console.log("[MAIN] Launching Telegram...");
+    await launchTelegramSafely();
+    
+    console.log("[MAIN] Connecting to Minecraft...");
+    connectMC();
+    
+    await sleep(STARTUP_SCAN_DELAY_MS);
+    
+    if (AUTO_SCAN && mcReady && tabReady) {
+      console.log("[MAIN] Performing initial scan...");
+      await performAutoScan();
+    }
+    
+    startWatchdog();
+    
+    if (AUTO_SCAN) {
+      const scanInterval = setInterval(() => {
+        if (mcReady && tabReady && !connecting) performAutoScan();
+      }, AUTO_SCAN_MINUTES * 60000);
+      addTimer(scanInterval);
+    }
+    
+    console.log("[MAIN] ✓ Bot is running!");
+  } catch (e) {
+    console.error("[MAIN] Fatal error:", e?.message || e);
+    process.exit(1);
+  }
+}
+
+main();
