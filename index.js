@@ -55,7 +55,10 @@ async function launchTelegramSafely() {
   while (true) {
     try {
       console.log("Telegram starting...");
-      await tg.launch({ dropPendingUpdates: true });
+      await tg.launch({
+        dropPendingUpdates: true,
+        allowedUpdates: [],
+      });
       console.log("Telegram started");
       return;
     } catch (e) {
@@ -431,10 +434,23 @@ setInterval(() => {
 }, 30000);
 
 /* ================== START ================== */
+process.once("SIGINT", () => {
+  try {
+    tg.stop("SIGINT");
+  } catch {}
+});
+
+process.once("SIGTERM", () => {
+  try {
+    tg.stop("SIGTERM");
+  } catch {}
+});
+
 (async () => {
-  await launchTelegramSafely();
-
-  console.log("TG started");
-
-  await connectMC();
+  try {
+    await launchTelegramSafely();
+    console.log("Telegram started OK");
+  } catch (e) {
+    console.log("Fatal TG error:", e?.message || e);
+  }
 })();
