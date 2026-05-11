@@ -23,11 +23,18 @@ const TAB_WARMUP_DELAY_MS = Number(process.env.TAB_WARMUP_DELAY_MS || 2000);
 const DEBUG_MODE = (process.env.DEBUG_MODE || "0") === "1";
 const GEMINI_KEY = process.env.GEMINI_KEY;
 
+// Webhook config - use env WEBHOOK_DOMAIN or default to Railway domain provided
+const WEBHOOK_DOMAIN = process.env.WEBHOOK_DOMAIN || "https://nickfindleragera-production.up.railway.app";
+const PORT = Number(process.env.PORT || 3000);
+const HOOK_PATH = process.env.HOOK_PATH || `/telegraf/${BOT_TOKEN}`;
+
 console.log("[INIT] Environment variables loaded");
 console.log("[INIT] BOT_TOKEN:", BOT_TOKEN ? "✓" : "✗");
 console.log("[INIT] MC_HOST:", MC_HOST || "✗");
 console.log("[INIT] MC_USER:", MC_USER || "✗");
 console.log("[INIT] CHAT_ID:", CHAT_ID || "✗");
+console.log("[INIT] WEBHOOK_DOMAIN:", WEBHOOK_DOMAIN || "(none)");
+console.log("[INIT] PORT:", PORT);
 
 if (!BOT_TOKEN || !MC_HOST || !MC_USER) {
   console.error("[FATAL] Missing: BOT_TOKEN, MC_HOST, or MC_USER");
@@ -52,19 +59,47 @@ tg.catch((err) => {
 
 async function launchTelegramSafely() {
   let attempts = 0;
+  // Prefer webhook if domain is set and PORT available
+  const useWebhook = Boolean(WEBHOOK_DOMAIN && WEBHOOK_DOMAIN.startsWith("http"));
+
   while (true) {
     try {
       attempts++;
-      console.log(`[TG] Launch attempt ${attempts}...`);
-      await tg.launch({
-        dropPendingUpdates: true,
-        allowedUpdates: [],
-      });
-      console.log("[TG] ✓ Launched successfully");
-      return;
+      if (useWebhook) {
+        console.log(`[TG] Launch attempt ${attempts} (webhook) ...`);
+        // try webhook mode
+        await tg.launch({
+          webhook: {
+            domain: WEBHOOK_DOMAIN,
+            port: PORT,
+            hookPath: HOOK_PATH,
+          },
+          dropPendingUpdates: true,
+        });
+        console.log("[TG] ✓ Launched successfully (webhook)");
+        console.log(`[TG] Webhook URL: ${WEBHOOK_DOMAIN}${HOOK_PATH}`);
+        return;
+      } else {
+        console.log(`[TG] Launch attempt ${attempts} (polling) ...`);
+        await tg.launch({ dropPendingUpdates: true });
+        console.log("[TG] ✓ Launched successfully (polling)");
+        return;
+      }
     } catch (e) {
       const msg = String(e?.message || e);
       console.error("[TG] Launch failed:", msg);
+
+      // If webhook failed twice, fallback to polling
+      if (useWebhook && attempts >= 2) {
+        console.warn("[TG] Webhook failed, falling back to polling mode");
+        try {
+          await tg.launch({ dropPendingUpdates: true });
+          console.log("[TG] ✓ Launched successfully (polling fallback)");
+          return;
+        } catch (err) {
+          console.error("[TG] Polling fallback failed:", err?.message || err);
+        }
+      }
 
       if (msg.includes("409") || msg.includes("Conflict")) {
         console.log("[TG] 409 conflict, waiting 15s...");
@@ -531,6 +566,7 @@ async function performAutoScan() {
 }
 
 /* ================== TELEGRAM COMMANDS ================== */
+// keep all existing commands and handlers
 tg.start((ctx) => {
   ctx.reply("🚀 Bot started\n\n/tab <prefix> - manual scan\n/status - show status\n/reload - reload rules\n/scan - force auto scan");
 });
