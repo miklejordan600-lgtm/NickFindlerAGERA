@@ -1,7 +1,30 @@
+import fs from "fs";
+import fsPromises from "fs/promises";
+import mineflayer from "mineflayer";
+import { Telegraf } from "telegraf";
+import { resolveSrv } from "dns/promises";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+/* ================== ENV ================== */
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
+const MC_HOST = (process.env.MC_HOST || "").trim();
+const MC_PORT = Number(process.env.MC_PORT || 25565);
+const MC_USER = process.env.MC_USER;
+const MC_VERSION = process.env.MC_VERSION === "false" ? false : (process.env.MC_VERSION || false);
+const MC_PASSWORD = process.env.MC_PASSWORD;
+const AUTO_SCAN = (process.env.AUTO_SCAN || "1") === "1";
+const AUTO_SCAN_MINUTES = Number(process.env.AUTO_SCAN_MINUTES || 10);
+const SCAN_DELAY_MS = Number(process.env.SCAN_DELAY_MS || 200);
+const AUTO_PREFIXES = (process.env.AUTO_PREFIXES || "").trim();
+const READY_AFTER_MS = Number(process.env.READY_AFTER_MS || 1500);
+const STARTUP_SCAN_DELAY_MS = Number(process.env.STARTUP_SCAN_DELAY_MS || 8000);
+const TAB_WARMUP_RETRIES = Number(process.env.TAB_WARMUP_RETRIES || 4);
+const TAB_WARMUP_DELAY_MS = Number(process.env.TAB_WARMUP_DELAY_MS || 2000);
 const DEBUG_MODE = (process.env.DEBUG_MODE || "0") === "1";
 const GEMINI_KEY = process.env.GEMINI_KEY;
 
-// Webhook config - use env WEBHOOK_DOMAIN or default to Railway domain provided
+// Webhook config
 const WEBHOOK_DOMAIN = process.env.WEBHOOK_DOMAIN || "https://nickfindleragera-production.up.railway.app";
 const PORT = Number(process.env.PORT || 3000);
 const HOOK_PATH = process.env.HOOK_PATH || `/telegraf/${BOT_TOKEN}`;
@@ -11,31 +34,36 @@ console.log("[INIT] BOT_TOKEN:", BOT_TOKEN ? "✓" : "✗");
 console.log("[INIT] MC_HOST:", MC_HOST || "✗");
 console.log("[INIT] MC_USER:", MC_USER || "✗");
 console.log("[INIT] CHAT_ID:", CHAT_ID || "✗");
-console.log("[INIT] WEBHOOK_DOMAIN:", WEBHOOK_DOMAIN || "(none)");
-console.log("[INIT] PORT:", PORT);
 
 if (!BOT_TOKEN || !MC_HOST || !MC_USER) {
   console.error("[FATAL] Missing: BOT_TOKEN, MC_HOST, or MC_USER");
-@@ -52,20 +59,48 @@
+  process.exit(1);
+}
+
+/* ================== DEBUG ================== */
+function debugLog(msg, data = null) {
+  if (DEBUG_MODE) {
+    console.log(`[DEBUG] ${msg}`, data || "");
+  }
+}
+
+/* ================== TELEGRAM ================== */
+const tg = new Telegraf(BOT_TOKEN);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+tg.catch((err) => {
+  console.error("[TG ERROR]", err?.message || err);
+});
 
 async function launchTelegramSafely() {
   let attempts = 0;
-  // Prefer webhook if domain is set and PORT available
   const useWebhook = Boolean(WEBHOOK_DOMAIN && WEBHOOK_DOMAIN.startsWith("http"));
 
   while (true) {
     try {
       attempts++;
-      console.log(`[TG] Launch attempt ${attempts}...`);
-      await tg.launch({
-        dropPendingUpdates: true,
-        allowedUpdates: [],
-      });
-      console.log("[TG] ✓ Launched successfully");
-      return;
       if (useWebhook) {
         console.log(`[TG] Launch attempt ${attempts} (webhook) ...`);
-        // try webhook mode
         await tg.launch({
           webhook: {
             domain: WEBHOOK_DOMAIN,
@@ -45,7 +73,6 @@ async function launchTelegramSafely() {
           dropPendingUpdates: true,
         });
         console.log("[TG] ✓ Launched successfully (webhook)");
-        console.log(`[TG] Webhook URL: ${WEBHOOK_DOMAIN}${HOOK_PATH}`);
         return;
       } else {
         console.log(`[TG] Launch attempt ${attempts} (polling) ...`);
@@ -57,7 +84,6 @@ async function launchTelegramSafely() {
       const msg = String(e?.message || e);
       console.error("[TG] Launch failed:", msg);
 
-      // If webhook failed twice, fallback to polling
       if (useWebhook && attempts >= 2) {
         console.warn("[TG] Webhook failed, falling back to polling mode");
         try {
@@ -70,157 +96,193 @@ async function launchTelegramSafely() {
       }
 
       if (msg.includes("409") || msg.includes("Conflict")) {
-        console.log("[TG] 409 conflict, waiting 15s...");
         await sleep(15000);
-@@ -531,150 +566,151 @@
+        continue;
+      }
+      await sleep(5000);
+    }
+  }
 }
 
-/* ================== TELEGRAM COMMANDS ================== */
-// keep all existing commands and handlers
-tg.start((ctx) => {
-  ctx.reply("🚀 Bot started\n\n/tab <prefix> - manual scan\n/status - show status\n/reload - reload rules\n/scan - force auto scan");
-});
-
-tg.command("status", (ctx) => {
-  const now = Date.now();
-  ctx.reply([
-    `<b>Status Report</b>`,
-    `MC Online: ${mcOnline ? "✅" : "❌"}`,
-    `MC Ready: ${mcReady ? "✅" : "❌"}`,
-    `TAB Ready: ${tabReady ? "✅" : "❌"}`,
-    `Tab failures: ${tabCompleteFailures}`,
-    `Last scan: ${Math.round((now - lastAutoScanTime) / 1000)}s ago`,
-    `Queue: ${tabCompleteQueue.length}`,
-  ].join("\n"), { parse_mode: "HTML" });
-});
-
-tg.command("reload", (ctx) => {
-  reloadRules();
-  ctx.reply("✅ Rules reloaded");
-});
-
-tg.command("scan", async (ctx) => {
-  if (!mcReady || !tabReady) {
-    ctx.reply("❌ MC not ready");
-    return;
-  }
-  ctx.reply("🔄 Scanning...");
-  await performAutoScan();
-  ctx.reply("✅ Scan completed");
-});
-
-tg.command("tab", async (ctx) => {
+function sendToTelegram(text, opts = {}) {
+  if (!CHAT_ID) return;
   try {
-    const arg = ctx.message.text.split(" ").slice(1).join(" ");
-    if (!arg) { ctx.reply("Usage: /tab <prefix>"); return; }
-    if (!mcReady || !tabReady) { ctx.reply("❌ MC not ready"); return; }
+    tg.telegram.sendMessage(CHAT_ID, text, {
+      parse_mode: "HTML",
+      ...opts,
+    }).catch(e => console.error("[TG SEND]", e?.message));
+  } catch (e) {
+    console.error("[TG SEND ERROR]", e?.message);
+  }
+}
 
-    const names = await byPrefix(arg);
-    let out = `🔎 Tab scan: <b>${arg}</b>\n\n`;
-    if (names.length === 0) {
-      out += "No players found";
-    } else {
-      for (const n of names) {
-        const [s, reasons] = checkNick(n);
-        const emoji = s === "BAN" ? "🚫" : s === "REVIEW" ? "⚠️" : "✅";
-        out += `${emoji} <code>${n}</code> - ${s}\n`;
-        if (reasons.length > 0) out += `    ${reasons.join(" | ")}\n`;
+/* ================== GEMINI ================== */
+let geminiClient = null;
+if (GEMINI_KEY) {
+  try {
+    geminiClient = new GoogleGenerativeAI(GEMINI_KEY);
+    console.log("[GEMINI] ✓ Initialized");
+  } catch (e) {
+    console.error("[GEMINI] Init failed:", e?.message);
+  }
+}
+
+async function checkNickWithAI(nick) {
+  if (!geminiClient) return null;
+  try {
+    const model = geminiClient.getGenerativeModel({ model: "gemini-pro" });
+    const prompt = `Analyze if this Minecraft nickname contains banned content (profanity, cheats, racism, extremism, drugs, body/sex references, insults, impersonation): "${nick}". Respond with JSON: {"suspicious": boolean, "reason": "text"}`;
+    
+    const result = await model.generateContent(prompt);
+    const response = result.response.text();
+    
+    try {
+      return JSON.parse(response);
+    } catch {
+      return { suspicious: false, reason: "parse_error" };
+    }
+  } catch (e) {
+    debugLog("GEMINI check error:", e?.message);
+    return null;
+  }
+}
+
+/* ================== RULES (FIXED: Async to prevent blocking) ================== */
+let RULES = { rules: [], review: [] };
+
+async function loadRules() {
+  try {
+    // Используем асинхронное чтение, чтобы не блокировать Event Loop
+    const data = await fsPromises.readFile("rules.json", "utf8");
+    RULES = JSON.parse(data);
+    console.log("[RULES] ✓ Loaded");
+  } catch (e) {
+    console.error("[RULES] Load failed or rules.json not found:", e?.message);
+    RULES = { rules: [], review: [] };
+  }
+}
+
+/* ================== NORMALIZE & CHECK ================== */
+function norm(s = "") {
+  return String(s)
+    .toLowerCase()
+    .replace(/§./g, "")
+    .replace(/[\s\-_.:,;|/\\~`'"^*+=()[\]{}<>]/g, "");
+}
+
+function checkNick(name) {
+  const n = norm(name);
+  for (const rule of RULES.rules || []) {
+    if ((rule.action || "").toUpperCase() !== "BAN") continue;
+    for (const w of rule.words || []) {
+      if (n.includes(norm(w))) {
+        return ["BAN", [`${rule.reason || rule.id}:${w}`]];
       }
     }
-    ctx.reply(out, { parse_mode: "HTML" });
-  } catch (e) {
-    ctx.reply("❌ ERR: " + String(e?.message || e));
   }
-});
-
-tg.command("connect", (ctx) => {
-  if (!connecting && !mcReady) {
-    ctx.reply("🔄 Connecting...");
-    connectMC();
-  } else {
-    ctx.reply("Already connecting or ready");
+  for (const w of RULES.review || []) {
+    if (n.includes(norm(w))) {
+      return ["REVIEW", [`review:${w}`]];
+    }
   }
-});
-
-/* ================== WATCHDOG ================== */
-function startWatchdog() {
-  const interval = setInterval(() => {
-    const now = Date.now();
-    if (mcOnline && (!mcReady || !tabReady) && !connecting) {
-      console.log("[WATCHDOG] Online but not ready");
-      scheduleReconnect("watchdog_not_ready");
-    }
-    if (mcReady && tabReady && (now - lastTabCompleteTime > 120000) && tabCompleteFailures > 5) {
-      console.log("[WATCHDOG] Tab inactive");
-      scheduleReconnect("watchdog_tab_inactive");
-    }
-    if (AUTO_SCAN && mcReady && tabReady && (now - lastAutoScanTime > (AUTO_SCAN_MINUTES * 60000 + 30000))) {
-      console.log("[WATCHDOG] Auto scan overdue");
-      performAutoScan();
-    }
-    if (mcOnline && (now - lastHeartbeat > 45000)) {
-      console.log("[WATCHDOG] Heartbeat timeout");
-      scheduleReconnect("watchdog_heartbeat");
-    }
-  }, 20000);
-  addTimer(interval);
+  return ["OK", []];
 }
 
-/* ================== GRACEFUL SHUTDOWN ================== */
-async function gracefulShutdown() {
-  console.log("[SHUTDOWN] Starting graceful shutdown...");
-  stopHeartbeat();
-  clearAllTimers();
-  clearAllListeners();
-  if (mc) {
-    try { mc.quit("shutdown"); } catch {}
-    try { mc.end(); } catch {}
-  }
-  try { await tg.stop("shutdown"); } catch {}
-  console.log("[SHUTDOWN] Complete");
-  process.exit(0);
-}
-
-process.on("SIGINT", () => gracefulShutdown());
-process.on("SIGTERM", () => gracefulShutdown());
-process.on("uncaughtException", (err) => {
-  console.error("[UNCAUGHT EXCEPTION]", err);
-  gracefulShutdown();
-});
-
-/* ================== MAIN STARTUP ================== */
-async function main() {
+/* ================== SRV ================== */
+async function resolveMcEndpoint(host, port) {
+  const h = String(host || "").trim();
   try {
-    console.log("[MAIN] Starting main sequence...");
-    loadRules();
-
-    console.log("[MAIN] Launching Telegram...");
-    await launchTelegramSafely();
-
-    console.log("[MAIN] Connecting to Minecraft...");
-    connectMC();
-
-    await sleep(STARTUP_SCAN_DELAY_MS);
-
-    if (AUTO_SCAN && mcReady && tabReady) {
-      console.log("[MAIN] Performing initial scan...");
-      await performAutoScan();
+    const srv = await resolveSrv(`_minecraft._tcp.${h}`);
+    if (srv?.length) {
+      srv.sort((a, b) => a.priority - b.priority);
+      return { host: srv[0].name, port: srv[0].port, via: "SRV" };
     }
-
-    startWatchdog();
-
-    if (AUTO_SCAN) {
-      const scanInterval = setInterval(() => {
-        if (mcReady && tabReady && !connecting) performAutoScan();
-      }, AUTO_SCAN_MINUTES * 60000);
-      addTimer(scanInterval);
-    }
-
-    console.log("[MAIN] ✓ Bot is running!");
-  } catch (e) {
-    console.error("[MAIN] Fatal error:", e?.message || e);
-    process.exit(1);
-  }
+  } catch {}
+  return { host: h, port: Number(port || 25565), via: "DIRECT" };
 }
 
-main();
+/* ================== MC BOT ENGINE (FIXED) ================== */
+let bot = null;
+let reconnectTimer = null;
+
+async function createMinecraftBot() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+
+  const endpoint = await resolveMcEndpoint(MC_HOST, MC_PORT);
+  console.log(`[MC] Connecting to ${endpoint.host}:${endpoint.port} (${endpoint.via})`);
+
+  // Загружаем правила асинхронно перед подключением
+  await loadRules();
+
+  bot = mineflayer.createBot({
+    host: endpoint.host,
+    port: endpoint.port,
+    username: MC_USER,
+    password: MC_PASSWORD,
+    version: MC_VERSION, // Убедитесь, что версия совпадает с сервером
+    hideErrors: true // Скрывает спам об ошибках чанков, если версия немного не совпадает
+  });
+
+  // ИСПРАВЛЕНИЕ УТЕЧКИ: Увеличиваем лимит слушателей
+  bot.setMaxListeners(20);
+
+  bot.on("login", () => {
+    console.log("[MC] ✓ Login successful");
+  });
+
+  bot.on("spawn", () => {
+    console.log("[MC] ✓ Spawned in world");
+    // Здесь можно добавить вашу логику проверки игроков (AUTO_SCAN)
+  });
+
+  bot.on("kicked", (reason) => {
+    console.log("[MC] Kicked:", reason);
+  });
+
+  bot.on("error", (err) => {
+    console.log("[MC] Error:", err?.message);
+  });
+
+  bot.on("end", (reason) => {
+    console.log("[MC] Disconnected:", reason);
+    
+    // ИСПРАВЛЕНИЕ УТЕЧКИ: Полностью очищаем слушатели перед пересозданием
+    bot.removeAllListeners();
+    bot = null;
+
+    // Планируем переподключение
+    reconnectTimer = setTimeout(() => {
+      console.log("[MC] Attempting to reconnect...");
+      createMinecraftBot();
+    }, 10000); // Реконнект через 10 секунд
+  });
+
+  // Пример сканирования чата на предмет новых игроков/подозрений
+  bot.on("playerJoined", async (player) => {
+    if (player.username === bot.username) return;
+    
+    const [status, reasons] = checkNick(player.username);
+    if (status === "BAN" || status === "REVIEW") {
+      console.log(`[SCAN] Suspicious nick detected: ${player.username} (${status})`);
+      sendToTelegram(`⚠️ <b>Suspicious Nickname</b>\nPlayer: <code>${player.username}</code>\nStatus: <b>${status}</b>\nReason: ${reasons.join(", ")}`);
+    } else if (GEMINI_KEY) {
+      // ИИ проверка, если обычные правила ничего не нашли
+      const aiResult = await checkNickWithAI(player.username);
+      if (aiResult?.suspicious) {
+        sendToTelegram(`🤖 <b>AI Flagged Nickname</b>\nPlayer: <code>${player.username}</code>\nReason: ${aiResult.reason}`);
+      }
+    }
+  });
+}
+
+/* ================== STARTUP ================== */
+async function start() {
+  await launchTelegramSafely();
+  await createMinecraftBot();
+}
+
+start();
+
+// Обработка крашей процесса
+process.on('uncaughtException', err => console.error('[FATAL] Uncaught Exception:', err));
+process.on('unhandledRejection', err => console.error('[FATAL] Unhandled Rejection:', err));
