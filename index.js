@@ -20,7 +20,6 @@ const MC_HOST = (process.env.MC_HOST || "").trim();
 const MC_PORT = Number(process.env.MC_PORT || 25565);
 const MC_USER = process.env.MC_USER;
 
-/* FIX */
 const MC_VERSION =
   process.env.MC_VERSION === "false"
     ? false
@@ -38,8 +37,18 @@ const STARTUP_SCAN_DELAY_MS = Number(process.env.STARTUP_SCAN_DELAY_MS || 8000);
 const TAB_WARMUP_RETRIES = Number(process.env.TAB_WARMUP_RETRIES || 4);
 const TAB_WARMUP_DELAY_MS = Number(process.env.TAB_WARMUP_DELAY_MS || 2000);
 
+const DEBUG_MODE = (process.env.DEBUG_MODE || "0") === "1";
+const GEMINI_KEY = process.env.GEMINI_KEY;
+
 if (!BOT_TOKEN || !MC_HOST || !MC_USER) {
   throw new Error("Нужны BOT_TOKEN, MC_HOST, MC_USER");
+}
+
+/* ================== DEBUG ================== */
+function debugLog(msg, data = null) {
+  if (DEBUG_MODE) {
+    console.log(`[DEBUG] ${msg}`, data || "");
+  }
 }
 
 /* ================== TG ================== */
@@ -76,11 +85,60 @@ async function launchTelegramSafely() {
   }
 }
 
+function sendToTelegram(text, opts = {}) {
+  if (!CHAT_ID) return;
+  try {
+    tg.telegram.sendMessage(CHAT_ID, text, {
+      parse_mode: "HTML",
+      ...opts,
+    }).catch(e => debugLog("TG send error:", e?.message));
+  } catch (e) {
+    debugLog("TG send catch:", e?.message);
+  }
+}
+
+/* ================== GEMINI ================== */
+let geminiClient = null;
+if (GEMINI_KEY) {
+  try {
+    geminiClient = new GoogleGenerativeAI(GEMINI_KEY);
+    console.log("[GEMINI] initialized");
+  } catch (e) {
+    console.log("[GEMINI] init error:", e?.message);
+  }
+}
+
+async function checkNickWithAI(nick) {
+  if (!geminiClient) return null;
+  
+  try {
+    const model = geminiClient.getGenerativeModel({ model: "gemini-pro" });
+    const prompt = `Analyze if this Minecraft nickname contains banned content (profanity, cheats, racism, extremism, drugs, body/sex references, insults, impersonation): "${nick}". Respond with JSON: {"suspicious": boolean, "reason": "text"}`;
+    
+    const result = await model.generateContent(prompt);
+    const response = result.response.text();
+    
+    try {
+      return JSON.parse(response);
+    } catch {
+      return { suspicious: false, reason: "parse_error" };
+    }
+  } catch (e) {
+    debugLog("GEMINI check error:", e?.message);
+    return null;
+  }
+}
+
 /* ================== RULES ================== */
 let RULES = JSON.parse(fs.readFileSync("rules.json", "utf8"));
 
 function reloadRules() {
-  RULES = JSON.parse(fs.readFileSync("rules.json", "utf8"));
+  try {
+    RULES = JSON.parse(fs.readFileSync("rules.json", "utf8"));
+    console.log("[RULES] reloaded");
+  } catch (e) {
+    console.log("[RULES] reload error:", e?.message);
+  }
 }
 
 /* ================== NORMALIZE ================== */
@@ -139,13 +197,51 @@ async function resolveMcEndpoint(host, port) {
   };
 }
 
-/* ================== MC ================== */
+/* ================== MC STATE ================== */
 let mc = null;
 let mcReady = false;
 let tabReady = false;
 let mcOnline = false;
 let reconnectTimer = null;
 let connecting = false;
+let lastTabCompleteTime = 0;
+let lastAutoScanTime = 0;
+let tabCompleteQueue = [];
+let isProcessingQueue = false;
+let loginAttempted = false;
+let heartbeatTimer = null;
+let lastHeartbeat = Date.now();
+let tabCompleteFailures = 0;
+const pendingTimers = new Set();
+const pendingListeners = [];
+
+function addTimer(timer) {
+  pendingTimers.add(timer);
+}
+
+function clearAllTimers() {
+  for (const timer of pendingTimers) {
+    try {
+      clearTimeout(timer);
+      clearInterval(timer);
+    } catch {}
+  }
+  pendingTimers.clear();
+}
+
+function addListener(obj, event, handler) {
+  pendingListeners.push({ obj, event, handler });
+  return { obj, event, handler };
+}
+
+function clearAllListeners() {
+  for (const { obj, event, handler } of pendingListeners) {
+    try {
+      obj.removeListener(event, handler);
+    } catch {}
+  }
+  pendingListeners.length = 0;
+}
 
 function scheduleReconnect(reason) {
   if (reconnectTimer) return;
@@ -156,24 +252,52 @@ function scheduleReconnect(reason) {
     reconnectTimer = null;
     connectMC();
   }, 5000);
+  
+  addTimer(reconnectTimer);
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  
+  heartbeatTimer = setInterval(() => {
+    lastHeartbeat = Date.now();
+    
+    if (mcReady && tabReady && mc && mc.health !== undefined) {
+      debugLog("Heartbeat OK", { health: mc.health, position: mc.player?.position });
+    } else if (mcOnline && (!mcReady || !tabReady)) {
+      console.log("[HEARTBEAT] WARNING: online but not ready");
+      scheduleReconnect("heartbeat_not_ready");
+    }
+  }, 15000);
+  
+  addTimer(heartbeatTimer);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
 }
 
 function tabComplete(bot, text) {
   return new Promise((res, rej) => {
     if (!bot?._client) {
+      tabCompleteFailures++;
       rej(new Error("CLIENT_NOT_READY"));
       return;
     }
 
     const c = bot._client;
-
     const timeout = setTimeout(() => {
       cleanup();
+      tabCompleteFailures++;
       rej(new Error("TAB_TIMEOUT"));
-    }, 3000);
+    }, 5000);
 
     const on = (p) => {
       cleanup();
+      tabCompleteFailures = 0;
 
       const matches =
         p?.matches?.map((x) =>
@@ -212,9 +336,65 @@ function tabComplete(bot, text) {
       });
     } catch (e) {
       cleanup();
+      tabCompleteFailures++;
       rej(e);
     }
   });
+}
+
+async function processTabCompleteQueue() {
+  if (isProcessingQueue) return;
+  isProcessingQueue = true;
+
+  try {
+    while (tabCompleteQueue.length > 0) {
+      const { prefix, resolve, reject } = tabCompleteQueue.shift();
+
+      try {
+        if (!mcReady || !tabReady) {
+          throw new Error("MC_NOT_READY");
+        }
+
+        const raw = await tabComplete(mc, `/msg ${prefix}`);
+        resolve(raw);
+        
+        lastTabCompleteTime = Date.now();
+      } catch (e) {
+        reject(e);
+      }
+
+      await sleep(SCAN_DELAY_MS);
+    }
+  } finally {
+    isProcessingQueue = false;
+  }
+}
+
+function byPrefixQueued(prefix) {
+  return new Promise((resolve, reject) => {
+    tabCompleteQueue.push({ prefix, resolve, reject });
+    processTabCompleteQueue();
+  });
+}
+
+async function byPrefix(prefix) {
+  if (!mcReady || !tabReady) {
+    throw new Error("MC_NOT_READY");
+  }
+
+  const raw = await tabComplete(mc, `/msg ${prefix}`);
+
+  function clean(s) {
+    return String(s).replace(/[^A-Za-z0-9_]/g, "");
+  }
+
+  return [
+    ...new Set(
+      raw
+        .map(clean)
+        .filter((x) => x.length >= 3 && x.length <= 16)
+    ),
+  ];
 }
 
 async function warmupTabReady(bot) {
@@ -225,6 +405,8 @@ async function warmupTabReady(bot) {
       if (Array.isArray(r)) {
         tabReady = true;
         mcReady = true;
+        loginAttempted = false;
+        lastTabCompleteTime = Date.now();
 
         console.log(`[MC] TAB ready on try ${i}`);
 
@@ -237,11 +419,15 @@ async function warmupTabReady(bot) {
     }
   }
 
+  tabCompleteFailures++;
   return false;
 }
 
 async function connectMC() {
-  if (connecting) return;
+  if (connecting) {
+    debugLog("Connect already in progress");
+    return;
+  }
 
   connecting = true;
 
@@ -255,12 +441,15 @@ async function connectMC() {
         mc.end();
       } catch {}
 
+      clearAllListeners();
       mc = null;
     }
 
     mcReady = false;
     tabReady = false;
     mcOnline = false;
+    loginAttempted = false;
+    tabCompleteFailures = 0;
 
     const ep = await resolveMcEndpoint(MC_HOST, MC_PORT);
 
@@ -274,31 +463,26 @@ async function connectMC() {
       user: MC_USER,
     });
 
-    /* FIXED BOT */
     mc = mineflayer.createBot({
       host: ep.host,
       port: ep.port,
-
       username: MC_USER,
-
       version: MC_VERSION,
-
       auth: "offline",
-
       hideErrors: false,
-
       checkTimeoutInterval: 30000,
-
       viewDistance: "tiny",
+      skipValidation: true,
+      validateMinecraftVersions: false,
     });
 
-    mc.on("login", () => {
+    const loginHandler = () => {
       mcOnline = true;
-
       console.log("[MC] login");
-    });
+      startHeartbeat();
+    };
 
-    mc.on("spawn", async () => {
+    const spawnHandler = async () => {
       console.log("[MC] spawn");
 
       await sleep(READY_AFTER_MS);
@@ -306,79 +490,172 @@ async function connectMC() {
       const ok = await warmupTabReady(mc);
 
       if (!ok) {
-        console.log("[MC] TAB failed");
-
-        scheduleReconnect("tab_failed");
-
+        console.log("[MC] TAB failed after spawn");
+        scheduleReconnect("tab_failed_spawn");
         return;
       }
 
-      console.log("[MC] READY");
-    });
+      console.log("[MC] READY - starting auto scan");
+      lastAutoScanTime = Date.now();
+    };
 
-    mc.on("messagestr", (msg) => {
+    const messageHandler = (msg) => {
       const m = String(msg).toLowerCase();
 
-      if (MC_PASSWORD && m.includes("login")) {
-        setTimeout(() => {
+      if (MC_PASSWORD && m.includes("login") && !loginAttempted) {
+        loginAttempted = true;
+        const t = setTimeout(() => {
           try {
             mc.chat(`/login ${MC_PASSWORD}`);
           } catch {}
         }, 1500);
+        addTimer(t);
       }
 
-      if (MC_PASSWORD && m.includes("register")) {
-        setTimeout(() => {
+      if (MC_PASSWORD && m.includes("register") && !loginAttempted) {
+        loginAttempted = true;
+        const t = setTimeout(() => {
           try {
             mc.chat(`/register ${MC_PASSWORD} ${MC_PASSWORD}`);
           } catch {}
         }, 1500);
+        addTimer(t);
       }
-    });
 
-    mc.on("kicked", (r) => {
+      if (m.includes("antibot") || m.includes("limbo")) {
+        console.log("[MC] detected antibot/limbo, reconnecting");
+        scheduleReconnect("antibot_limbo");
+      }
+    };
+
+    const kickedHandler = (r) => {
       console.log("[MC] kicked:", r);
-
       scheduleReconnect("kicked");
-    });
+    };
 
-    mc.on("end", () => {
+    const endHandler = () => {
       console.log("[MC] disconnected");
-
+      stopHeartbeat();
       scheduleReconnect("end");
-    });
+    };
 
-    mc.on("error", (e) => {
+    const errorHandler = (e) => {
       console.log("[MC ERROR]", e?.stack || e?.message || e);
-    });
+      
+      if (String(e?.message || e).includes("ECONNREFUSED") || 
+          String(e?.message || e).includes("ETIMEDOUT")) {
+        scheduleReconnect("connection_error");
+      }
+    };
+
+    addListener(mc, "login", loginHandler);
+    addListener(mc, "spawn", spawnHandler);
+    addListener(mc, "messagestr", messageHandler);
+    addListener(mc, "kicked", kickedHandler);
+    addListener(mc, "end", endHandler);
+    addListener(mc, "error", errorHandler);
+
+    mc.on("login", loginHandler);
+    mc.on("spawn", spawnHandler);
+    mc.on("messagestr", messageHandler);
+    mc.on("kicked", kickedHandler);
+    mc.on("end", endHandler);
+    mc.on("error", errorHandler);
+
   } catch (e) {
     console.log("[MC CONNECT ERROR]", e?.message || e);
-
+    stopHeartbeat();
     scheduleReconnect("connect_error");
   } finally {
     connecting = false;
   }
 }
 
-/* ================== SCAN ================== */
-function clean(s) {
-  return String(s).replace(/[^A-Za-z0-9_]/g, "");
-}
-
-async function byPrefix(prefix) {
-  if (!mcReady || !tabReady) {
-    throw new Error("MC_NOT_READY");
+/* ================== AUTO SCAN ================== */
+async function performAutoScan() {
+  if (!AUTO_SCAN || !mcReady || !tabReady) {
+    return;
   }
 
-  const raw = await tabComplete(mc, `/msg ${prefix}`);
+  try {
+    console.log("[AUTO SCAN] starting");
 
-  return [
-    ...new Set(
-      raw
-        .map(clean)
-        .filter((x) => x.length >= 3 && x.length <= 16)
-    ),
-  ];
+    const prefixes = AUTO_PREFIXES
+      ? AUTO_PREFIXES.split(",").map(p => p.trim()).filter(p => p)
+      : ["a", "b", "c"];
+
+    const allNicks = [];
+
+    for (const prefix of prefixes) {
+      try {
+        const names = await byPrefixQueued(prefix);
+        allNicks.push(...names);
+        debugLog(`Auto scan prefix ${prefix}:`, names.length);
+      } catch (e) {
+        console.log(`[AUTO SCAN] prefix ${prefix} error:`, e?.message);
+      }
+
+      await sleep(SCAN_DELAY_MS);
+    }
+
+    const unique = [...new Set(allNicks)];
+
+    let banCount = 0;
+    let reviewCount = 0;
+    let results = [];
+
+    for (const nick of unique) {
+      const [status, reasons] = checkNick(nick);
+
+      if (status === "BAN") {
+        banCount++;
+        results.push({ nick, status, reasons });
+      } else if (status === "REVIEW") {
+        reviewCount++;
+        results.push({ nick, status, reasons });
+
+        if (geminiClient) {
+          const aiResult = await checkNickWithAI(nick);
+          if (aiResult?.suspicious) {
+            results[results.length - 1].aiReason = aiResult.reason;
+          }
+        }
+      }
+    }
+
+    const html = [
+      `<b>🔎 Auto Scan Report</b>`,
+      `Scanned: ${unique.length}`,
+      `Ban: ${banCount}`,
+      `Review: ${reviewCount}`,
+      ``,
+    ];
+
+    if (banCount > 0) {
+      html.push(`<b>🚫 BAN LIST:</b>`);
+      for (const { nick, reasons } of results.filter(r => r.status === "BAN")) {
+        html.push(`<code>${nick}</code> - ${reasons.join(", ")}`);
+      }
+      html.push(``);
+    }
+
+    if (reviewCount > 0) {
+      html.push(`<b>⚠️ REVIEW LIST:</b>`);
+      for (const { nick, reasons, aiReason } of results.filter(r => r.status === "REVIEW")) {
+        const extra = aiReason ? ` [AI: ${aiReason}]` : "";
+        html.push(`<code>${nick}</code> - ${reasons.join(", ")}${extra}`);
+      }
+    }
+
+    if (html.length > 5) {
+      sendToTelegram(html.join("\n"));
+    }
+
+    lastAutoScanTime = Date.now();
+    console.log("[AUTO SCAN] completed:", { unique: unique.length, ban: banCount, review: reviewCount });
+  } catch (e) {
+    console.log("[AUTO SCAN] error:", e?.message || e);
+  }
 }
 
 /* ================== COMMANDS ================== */
@@ -387,70 +664,206 @@ tg.start((ctx) => {
     [
       "🚀 Bot started",
       "",
-      "/tab a",
-      "/status",
+      "/tab <prefix> - manual scan",
+      "/status - show status",
+      "/reload - reload rules",
+      "/scan - force auto scan",
     ].join("\n")
   );
 });
 
 tg.command("status", (ctx) => {
+  const now = Date.now();
+  const lastScanAgo = Math.round((now - lastAutoScanTime) / 1000);
+  const lastTabAgo = Math.round((now - lastTabCompleteTime) / 1000);
+  
   ctx.reply(
     [
-      `MC online: ${mcOnline}`,
-      `MC ready: ${mcReady}`,
-      `TAB ready: ${tabReady}`,
-      `Version: ${MC_VERSION}`,
-    ].join("\n")
+      `<b>Status Report</b>`,
+      ``,
+      `MC Online: ${mcOnline ? "✅" : "❌"}`,
+      `MC Ready: ${mcReady ? "✅" : "❌"}`,
+      `TAB Ready: ${tabReady ? "✅" : "❌"}`,
+      `Connecting: ${connecting ? "⏳" : "✅"}`,
+      ``,
+      `Version: ${MC_VERSION || "auto"}`,
+      `Tab failures: ${tabCompleteFailures}`,
+      `Last scan: ${lastScanAgo}s ago`,
+      `Last tab: ${lastTabAgo}s ago`,
+      `Queue length: ${tabCompleteQueue.length}`,
+    ].join("\n"),
+    { parse_mode: "HTML" }
   );
+});
+
+tg.command("reload", (ctx) => {
+  reloadRules();
+  ctx.reply("✅ Rules reloaded");
+});
+
+tg.command("scan", async (ctx) => {
+  if (!mcReady || !tabReady) {
+    ctx.reply("❌ MC not ready");
+    return;
+  }
+
+  ctx.reply("🔄 Scanning...");
+  await performAutoScan();
+  ctx.reply("✅ Scan completed");
 });
 
 tg.command("tab", async (ctx) => {
   try {
     const arg = ctx.message.text.split(" ").slice(1).join(" ");
 
-    const names = await byPrefix(arg);
-
-    let out = `🔎 ${arg}\n\n`;
-
-    for (const n of names) {
-      const [s] = checkNick(n);
-
-      out += `${n} -> ${s}\n`;
+    if (!arg) {
+      ctx.reply("Usage: /tab <prefix>");
+      return;
     }
 
-    ctx.reply(out || "empty");
+    if (!mcReady || !tabReady) {
+      ctx.reply("❌ MC not ready");
+      return;
+    }
+
+    const names = await byPrefix(arg);
+
+    let out = `🔎 Tab scan: <b>${arg}</b>\n\n`;
+
+    if (names.length === 0) {
+      out += "No players found";
+    } else {
+      for (const n of names) {
+        const [s, reasons] = checkNick(n);
+        const emoji = s === "BAN" ? "🚫" : s === "REVIEW" ? "⚠️" : "✅";
+        out += `${emoji} <code>${n}</code> - ${s}\n`;
+
+        if (reasons.length > 0) {
+          out += `    ${reasons.join(" | ")}\n`;
+        }
+      }
+    }
+
+    ctx.reply(out, { parse_mode: "HTML" });
   } catch (e) {
-    ctx.reply("ERR: " + String(e?.message || e));
+    ctx.reply("❌ ERR: " + String(e?.message || e));
+  }
+});
+
+tg.command("connect", async (ctx) => {
+  if (!connecting && !mcReady) {
+    ctx.reply("🔄 Connecting...");
+    connectMC();
+  } else {
+    ctx.reply("Already connecting or ready");
   }
 });
 
 /* ================== WATCHDOG ================== */
-setInterval(() => {
-  if (mcOnline && (!mcReady || !tabReady) && !connecting) {
-    console.log("[WATCHDOG] reconnect");
+function startWatchdog() {
+  const watchdogInterval = setInterval(() => {
+    const now = Date.now();
 
-    scheduleReconnect("watchdog");
-  }
-}, 30000);
+    // Check if online but not ready
+    if (mcOnline && (!mcReady || !tabReady) && !connecting) {
+      console.log("[WATCHDOG] online but not ready - reconnecting");
+      scheduleReconnect("watchdog_not_ready");
+    }
 
-/* ================== START ================== */
-process.once("SIGINT", () => {
-  try {
-    tg.stop("SIGINT");
-  } catch {}
-});
+    // Check if tab_complete hasn't been used recently
+    if (mcReady && tabReady && (now - lastTabCompleteTime > 120000)) {
+      console.log("[WATCHDOG] tab_complete inactive for 2 minutes");
+      if (tabCompleteFailures > 5) {
+        scheduleReconnect("watchdog_tab_inactive");
+      }
+    }
 
-process.once("SIGTERM", () => {
-  try {
-    tg.stop("SIGTERM");
-  } catch {}
-});
+    // Check if auto scan hasn't run recently
+    if (AUTO_SCAN && mcReady && tabReady && (now - lastAutoScanTime > (AUTO_SCAN_MINUTES * 60000 + 30000))) {
+      console.log("[WATCHDOG] auto scan overdue");
+      performAutoScan();
+    }
 
-(async () => {
+    // Check heartbeat
+    if (mcOnline && (now - lastHeartbeat > 45000)) {
+      console.log("[WATCHDOG] heartbeat timeout");
+      scheduleReconnect("watchdog_heartbeat");
+    }
+  }, 20000);
+
+  addTimer(watchdogInterval);
+  return watchdogInterval;
+}
+
+/* ================== STARTUP SEQUENCE ================== */
+async function startupSequence() {
+  console.log("[STARTUP] beginning startup sequence");
+  
   try {
     await launchTelegramSafely();
-    console.log("Telegram started OK");
+    console.log("[STARTUP] telegram ready");
   } catch (e) {
-    console.log("Fatal TG error:", e?.message || e);
+    console.log("[STARTUP] telegram error:", e?.message);
   }
-})();
+
+  await sleep(2000);
+
+  console.log("[STARTUP] connecting to minecraft");
+  connectMC();
+
+  await sleep(STARTUP_SCAN_DELAY_MS);
+
+  if (AUTO_SCAN && mcReady && tabReady) {
+    console.log("[STARTUP] performing initial auto scan");
+    await performAutoScan();
+  }
+
+  startWatchdog();
+
+  if (AUTO_SCAN && mcReady && tabReady) {
+    const autoScanInterval = setInterval(() => {
+      if (mcReady && tabReady && !connecting) {
+        performAutoScan();
+      }
+    }, AUTO_SCAN_MINUTES * 60000);
+
+    addTimer(autoScanInterval);
+  }
+
+  console.log("[STARTUP] sequence complete");
+}
+
+/* ================== GRACEFUL SHUTDOWN ================== */
+async function gracefulShutdown() {
+  console.log("[SHUTDOWN] beginning graceful shutdown");
+
+  stopHeartbeat();
+  clearAllTimers();
+  clearAllListeners();
+
+  if (mc) {
+    try {
+      mc.quit("shutdown");
+    } catch {}
+
+    try {
+      mc.end();
+    } catch {}
+  }
+
+  try {
+    await tg.stop("shutdown");
+  } catch {}
+
+  console.log("[SHUTDOWN] complete");
+  process.exit(0);
+}
+
+process.once("SIGINT", () => gracefulShutdown());
+process.once("SIGTERM", () => gracefulShutdown());
+
+/* ================== START ================== */
+startupSequence().catch(e => {
+  console.log("[STARTUP] fatal error:", e?.message || e);
+  process.exit(1);
+});
