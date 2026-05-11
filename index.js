@@ -1,13 +1,13 @@
-const { Telegraf, Markup } = require('telegraf');
-const mineflayer = require('mineflayer');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const fs = require('fs');
-const path = require('path');
+import { Telegraf, Markup } from 'telegraf';
+import mineflayer from 'mineflayer';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-/**
- * FULL INDEX.JS - IMPROVED MINEFLAYER + TELEGRAM BOT
- * Сохранена вся логика, исправлены утечки, улучшен реконнект и watchdog.
- */
+// --- ESM COMPATIBILITY ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // --- CONFIGURATION ---
 const config = {
@@ -16,7 +16,7 @@ const config = {
     mcHost: 'production.agerapvp.club',
     mcPort: 25565,
     mcUser: 'ModerBot_AI',
-    mcPass: 'ВашПароль', // Пароль для /login
+    mcPass: 'YOUR_PASS',
     geminiKey: process.env.GEMINI_KEY || 'YOUR_GEMINI_KEY',
     scanInterval: 300000,
     reconnectDelay: 60000,
@@ -73,7 +73,7 @@ const clearAllTimers = () => {
 // --- AI CORE ---
 async function checkWithAI(nick) {
     try {
-        const prompt = `Проверь никнейм "${nick}" на нарушения (маты, оскорбления, нацизм, обходы). Ответь ТОЛЬКО JSON: {"violation": true/false, "reason": "почему"}`;
+        const prompt = `Проверь никнейм "${nick}" на соответствие правилам (маты, оскорбления, нацизм). Ответь строго JSON: {"violation": true/false, "reason": "почему"}`;
         const result = await modelAI.generateContent(prompt);
         const text = result.response.text().replace(/```json|```/g, '').trim();
         return JSON.parse(text);
@@ -104,22 +104,18 @@ function connectMC() {
         checkTimeoutInterval: 90000
     });
 
-    // Устранение утечки слушателей
     botMC.setMaxListeners(50);
 
-    // Защита от Chunk/Sound Packet Error
+    // Packet Overflow Protection
     botMC._client.on('packet', (data, meta) => {
-        if (['map_chunk', 'sound_effect', 'multi_block_change', 'world_event'].includes(meta.name)) {
-            // Игнорируем тяжелые пакеты для стабильности на VPS
-            return;
-        }
+        if (['map_chunk', 'sound_effect', 'multi_block_change'].includes(meta.name)) return;
     });
 
     botMC.on('login', () => {
-        log('MC', 'Авторизован на прокси/сервере');
+        log('MC', 'Авторизован');
         isConnecting = false;
         setTimeout(() => {
-            if (botMC) {
+            if (botMC?.chat) {
                 botMC.chat(`/login ${config.mcPass}`);
                 botMC.chat(`/register ${config.mcPass} ${config.mcPass}`);
             }
@@ -127,7 +123,7 @@ function connectMC() {
     });
 
     botMC.once('spawn', () => {
-        log('MC', 'Бот заспавнился (Ready)');
+        log('MC', 'Бот в игре');
         mcReady = true;
         lastTabResponse = Date.now();
         startAutoScan();
@@ -136,7 +132,6 @@ function connectMC() {
 
     botMC.on('messagestr', (msg) => {
         if (msg.trim()) log('CHAT', msg);
-        // Авто-релогин если сессия сброшена
         if (msg.includes('/login') || msg.includes('авторизуйтесь')) {
             botMC.chat(`/login ${config.mcPass}`);
         }
@@ -148,7 +143,7 @@ function connectMC() {
     });
 
     botMC.on('end', (reason) => {
-        log('MC-END', `Отключено: ${reason}`);
+        log('MC-END', `Выход: ${reason}`);
         mcReady = false;
         scheduleReconnect();
     });
@@ -177,7 +172,7 @@ async function runScan(useAI = false) {
     try {
         const players = await new Promise((resolve) => {
             const t = setTimeout(() => {
-                botMC.removeListener('tab_complete', onTab);
+                if (botMC) botMC.removeListener('tab_complete', onTab);
                 resolve([]);
             }, config.tabTimeout);
 
@@ -186,7 +181,7 @@ async function runScan(useAI = false) {
                 resolve(matches);
             }
             botMC.once('tab_complete', onTab);
-            botMC.tabComplete('/msg '); // Абуз команды для получения списка ников
+            botMC.tabComplete('/msg '); 
         });
 
         if (players.length === 0) {
@@ -204,7 +199,6 @@ async function runScan(useAI = false) {
             const norm = normalizeNick(nick);
             let bad = false;
 
-            // Rules filter
             for (const word of rules.badWords) {
                 if (norm.includes(word.toLowerCase())) {
                     violations.push({ nick, reason: `Фильтр: ${word}`, type: 'AUTO' });
@@ -213,7 +207,6 @@ async function runScan(useAI = false) {
                 }
             }
 
-            // AI Check
             if (!bad && useAI) {
                 const ai = await checkWithAI(nick);
                 if (ai.violation) {
@@ -232,11 +225,9 @@ async function runScan(useAI = false) {
                 parse_mode: 'HTML',
                 ...Markup.inlineKeyboard([
                     [Markup.button.callback('🔍 Повторить скан', 'scan_fast')],
-                    [Markup.button.callback('🤖 AI Глубокая проверка', 'scan_ai')]
+                    [Markup.button.callback('🤖 AI Анализ', 'scan_ai')]
                 ])
             });
-        } else if (useAI) {
-            botTG.telegram.sendMessage(config.adminId, "✅ AI проверку прошли все игроки.");
         }
 
     } catch (e) {
@@ -246,19 +237,16 @@ async function runScan(useAI = false) {
     }
 }
 
-// --- WATCHDOG & RECOVERY ---
+// --- WATCHDOG ---
 function startWatchdog() {
     if (watchdogTimer) clearInterval(watchdogTimer);
     watchdogTimer = setInterval(() => {
         if (mcReady) {
-            // Проверка "зависания" таба
             if (Date.now() - lastTabResponse > (config.tabTimeout * 3)) {
-                log('WATCHDOG', 'Tab_complete не отвечает. Перезапуск...');
+                log('WATCHDOG', 'Детекция зависания. Реконнект...');
                 scheduleReconnect();
             }
-            // Проверка "зависания" цикла сканирования
             if (Date.now() - lastScanTime > (config.scanInterval * 2)) {
-                log('WATCHDOG', 'Авто-скан замер. Принудительный сброс...');
                 isScanning = false;
                 runScan();
             }
@@ -273,64 +261,54 @@ function startAutoScan() {
 
 // --- TELEGRAM COMMANDS ---
 botTG.start((ctx) => {
-    ctx.reply('🛡️ Бот-модератор запущен и готов к работе.', Markup.keyboard([
+    ctx.reply('🛡️ Модератор онлайн.', Markup.keyboard([
         ['🔍 Быстрый скан', '🤖 AI Скан'],
         ['📊 Статус', '🔄 Реконнект']
     ]).resize());
 });
 
 botTG.hears('🔍 Быстрый скан', (ctx) => {
-    if (!mcReady) return ctx.reply('❌ Бот не в сети.');
+    if (!mcReady) return ctx.reply('❌ Оффлайн');
     runScan(false);
-    ctx.reply('🔎 Запущен быстрый поиск по правилам...');
+    ctx.reply('🔎 Поиск по правилам...');
 });
 
 botTG.hears('🤖 AI Скан', (ctx) => {
-    if (!mcReady) return ctx.reply('❌ Бот не в сети.');
+    if (!mcReady) return ctx.reply('❌ Оффлайн');
     runScan(true);
-    ctx.reply('🧠 Запущен глубокий AI анализ онлайна...');
+    ctx.reply('🧠 AI Анализ запущен...');
 });
 
 botTG.hears('📊 Статус', (ctx) => {
     const status = mcReady ? '✅ Online' : '❌ Offline';
-    const scanInfo = isScanning ? '🔄 В процессе' : '💤 Спит';
-    ctx.reply(`<b>Системный отчет:</b>\n• Сервер: ${status}\n• Сканер: ${scanInfo}\n• Последний скан: ${new Date(lastScanTime).toLocaleTimeString()}\n• RAM: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`, { parse_mode: 'HTML' });
+    ctx.reply(`<b>Система:</b>\n• MC: ${status}\n• Сканер: ${isScanning ? '🔄' : '💤'}`, { parse_mode: 'HTML' });
 });
 
 botTG.hears('🔄 Реконнект', (ctx) => {
-    ctx.reply('⏳ Выполняю принудительный перезапуск подключения...');
+    ctx.reply('⏳ Перезапуск...');
     scheduleReconnect();
 });
 
 botTG.action('scan_fast', (ctx) => runScan(false));
 botTG.action('scan_ai', (ctx) => runScan(true));
 
-// --- CRASH PROTECTION ---
+// --- LIFECYCLE ---
 process.on('uncaughtException', (err) => {
     log('CRITICAL', err.message);
     scheduleReconnect();
 });
 
-process.on('unhandledRejection', (reason) => {
-    log('REJECTION', reason);
-});
-
-// --- STARTUP ---
 (async () => {
     try {
         await botTG.launch();
-        log('TG', 'Telegram бот онлайн');
+        log('TG', 'Telegram запущен');
         connectMC();
     } catch (e) {
-        log('FATAL', `Startup failed: ${e.message}`);
+        log('FATAL', e.message);
         setTimeout(() => process.exit(1), 10000);
     }
 })();
 
-// Railway/VPS Keep-alive
 setInterval(() => {
-    if (!isConnecting && !mcReady && !reconnectTimer) {
-        log('HEALTH', 'Система простаивает без коннекта. Восстановление...');
-        connectMC();
-    }
+    if (!isConnecting && !mcReady && !reconnectTimer) connectMC();
 }, 180000);
