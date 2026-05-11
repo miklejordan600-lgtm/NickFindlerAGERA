@@ -1,0 +1,163 @@
+{
+  "version": 2,
+  "normalization": {
+    "lowercase": true,
+    "strip_invisibles_regex": "[\\u200B-\\u200F\\u202A-\\u202E\\u2060\\uFEFF]",
+    "separators_regex": "[\\s\\-_.:,;|/\\\\~`'\"^*+=()\\[\\]{}<>]+",
+    "collapse_repeats": true,
+    "max_repeat": 2,
+    "leet_map": {
+      "0": "o",
+      "1": "i",
+      "3": "e",
+      "4": "a",
+      "5": "s",
+      "7": "t",
+      "@": "a",
+      "$": "s"
+    }
+  },
+
+  "rules": [
+    {
+      "id": "BAN_PROFANITY_AMORAL",
+      "action": "BAN",
+      "reason": "Мат / аморальные слова",
+      "words": [
+        "hui","hyi","xuy","xyu","xue",
+        "pizd","piz","pis","piss",
+        "bly","blya","blyat",
+        "ebal","eby","ebalo","ebanat",
+        "yeb","yeban","yebal","yebat",
+        "zalup","bebra","bebrik",
+        "gandon","gand0n","eblan",
+        "pezduk","pezduck",
+        "piska","gey","fuck",
+        "sosi","sperma","soso","konch",
+        "kotak","k0tak","kot4k","k0t4k",
+        "govn","govnoed","g0vn","g0vn0ed",
+        "kotakbas","kotokbas","perd"
+      ]
+    },
+
+    {
+      "id": "BAN_INSULTS",
+      "action": "BAN",
+      "reason": "Оскорбления",
+      "words": [
+        "debill","daun",
+        "pidor","pidr","pido","p1dor",
+        "lox",
+        "idiot","moron",
+        "degenerat","degenerate",
+        "trash","scum","loser",
+        "mudak","shalava","shluxa",
+        "dolboeb","dolbaeb","dalboeb"
+      ]
+    },
+
+    {
+      "id": "BAN_BODY_SEX",
+      "action": "BAN",
+      "reason": "Тело / секс / 18+",
+      "words": [
+        "jopa","jopki",
+        "popa","popka","popki",
+        "penis","anus","pesun",
+        "dildo",
+        "porn","porno","sex",
+        "cock","dick","pussy","cunt",
+        "anal","analka",
+        "fimoz"
+      ]
+    },
+
+    {
+      "id": "BAN_DRUGS",
+      "action": "BAN",
+      "reason": "Наркотики",
+      "words": [
+        "mefedron",
+        "heroin",
+        "weed",
+        "hash",
+        "amfetamin",
+        "spice"
+      ]
+    },
+
+    {
+      "id": "BAN_EXTREMISM_RACISM",
+      "action": "BAN",
+      "reason": "Экстремизм / расизм",
+      "words": [
+        "1488",
+        "hitler","giltler","g1tler","gitler","heil",
+        "nigger","nigga","negr","rasist"
+      ]
+    },
+
+    {
+      "id": "BAN_CHEATS",
+      "action": "BAN",
+      "reason": "Чит-клиенты / софт",
+      "words": [
+        "newlauncher","flauncher",
+        "augustus","vape","vapelite","vapev4",
+        "doomsday","nursultanclient",
+        "wurst",
+        "impact","meteor",
+        "aristois",
+        "liquidbounce",
+        "future","inertia",
+        "rusherhack",
+        "thunderhack","salhack",
+        "novoline","exhibition",
+        "skilled","astolfo",
+        "zeroday","moonlight",
+        "nexus",
+        "eternity","crimson"
+      ]
+    },
+
+    {
+      "id": "BAN_IMPERSONATION",
+      "action": "BAN",
+      "reason": "Маскировка под персонал",
+      "words": [
+        "owner","admin","helper",
+        "moder",
+        "administrator","moderator"
+      ]
+    },
+
+    {
+      "id": "BAN_PROJECT",
+      "action": "BAN",
+      "reason": "Проект / сервер",
+      "words": [
+        "agera",
+        "agerapvp",
+        "agerapvpclub"
+      ]
+    }
+  ],
+
+  "review": [
+    "niger",
+    "svo",
+    "cbo",
+    "zov",
+    "sex",
+    "nagibator"
+  ],
+
+  "whitelist_exact": [
+    "maktraher",
+    "agera001",
+    "picun"
+  ]
+}
+
+
+
