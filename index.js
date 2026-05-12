@@ -12,29 +12,15 @@ const MC_HOST = process.env.MC_HOST;
 const MC_PORT = Number(process.env.MC_PORT || 25565);
 const MC_USER = process.env.MC_USER;
 const MC_VERSION = process.env.MC_VERSION || "1.8.9";
-const MC_PASSWORD = process.env.MC_PASSWORD;
-
-const AUTO_SCAN = (process.env.AUTO_SCAN || "1") === "1";
-const AUTO_SCAN_MINUTES = Number(process.env.AUTO_SCAN_MINUTES || 10);
-const SCAN_DELAY_MS = Number(process.env.SCAN_DELAY_MS || 200);
-
-if (!BOT_TOKEN || !MC_HOST || !MC_USER) {
-  throw new Error("Missing BOT_TOKEN / MC_HOST / MC_USER");
-}
 
 /* ================== BOT ================== */
 const tg = new Telegraf(BOT_TOKEN);
 
 /* ================== STATE ================== */
 let mc = null;
-let session = 0;
-let mcReady = false;
-let mcOnline = false;
-let tabReady = false;
-
-let reconnectTimer = null;
-let autoScanTimer = null;
-let scanning = false;
+let ready = false;
+let reconnecting = false;
+let scanQueue = Promise.resolve();
 
 /* ================== UTILS ================== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -56,27 +42,34 @@ function destroyMC() {
 
 /* ================== RECONNECT ================== */
 function reconnect(reason) {
-  if (reconnectTimer) return;
-
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectMC();
-  }, 5000);
+  if (reconnecting) return;
+  reconnecting = true;
 
   console.log("[MC] reconnect:", reason);
+
+  setTimeout(() => {
+    reconnecting = false;
+    connectMC();
+  }, 5000);
 }
 
-/* ================== TAB SAFE ================== */
+/* ================== TAB FIX (ВАЖНО) ================== */
 function tabComplete(text) {
   return new Promise((resolve, reject) => {
     if (!mc) return reject("NO_MC");
 
     const c = mc._client;
-    const timeout = setTimeout(() => reject("TAB_TIMEOUT"), 3000);
+
+    const timeout = setTimeout(() => {
+      reject("TAB_TIMEOUT");
+    }, 3000);
 
     const handler = (p) => {
       clearTimeout(timeout);
-      const matches = p?.matches?.map(x => x.text || x) || [];
+
+      const matches =
+        p?.matches?.map(x => (typeof x === "string" ? x : x.text)) || [];
+
       resolve(matches);
     };
 
@@ -95,14 +88,10 @@ function tabComplete(text) {
   });
 }
 
-/* ================== CONNECT MC ================== */
+/* ================== CONNECT ================== */
 async function connectMC() {
-  const mySession = ++session;
-
   destroyMC();
-  mcReady = false;
-  mcOnline = false;
-  tabReady = false;
+  ready = false;
 
   try {
     const srv = await resolveSrv(`_minecraft._tcp.${MC_HOST}`).catch(() => null);
@@ -116,25 +105,17 @@ async function connectMC() {
       version: MC_VERSION,
     });
 
-    mc.on("login", () => {
-      mcOnline = true;
-      console.log("[MC] login");
-    });
-
-    mc.on("spawn", async () => {
+    mc.once("spawn", async () => {
       console.log("[MC] spawn");
 
       await sleep(1500);
 
       try {
         await tabComplete("/msg a");
-        mcReady = true;
-        tabReady = true;
-
+        ready = true;
         console.log("[MC] READY");
-
-        if (AUTO_SCAN) startAutoScan();
-      } catch {
+      } catch (e) {
+        console.log("[MC] TAB FAIL:", e);
         reconnect("tab_fail");
       }
     });
@@ -142,86 +123,112 @@ async function connectMC() {
     mc.on("messagestr", (msg) => {
       const m = String(msg).toLowerCase();
 
-      if (MC_PASSWORD && m.includes("login")) {
-        mc.chat(`/login ${MC_PASSWORD}`);
+      if (m.includes("login")) {
+        mc.chat(`/login ${process.env.MC_PASSWORD}`);
       }
-
-      if (MC_PASSWORD && m.includes("register")) {
-        mc.chat(`/register ${MC_PASSWORD} ${MC_PASSWORD}`);
+      if (m.includes("register")) {
+        mc.chat(`/register ${process.env.MC_PASSWORD} ${process.env.MC_PASSWORD}`);
       }
     });
 
     mc.on("end", () => reconnect("end"));
-    mc.on("kicked", () => reconnect("kicked"));
-    mc.on("error", (e) => reconnect(e?.message));
+    mc.on("kicked", () => reconnect("kick"));
+    mc.on("error", () => reconnect("error"));
 
   } catch (e) {
     console.log("[MC] connect error:", e);
-    reconnect("connect_fail");
+    reconnect("connect_error");
   }
 }
 
-/* ================== CHECK ================== */
+/* ================== SCAN ENGINE (FIXED) ================== */
+function scanTab(prefix) {
+  return scanQueue = scanQueue.then(async () => {
+    if (!mc || !ready) throw new Error("MC_NOT_READY");
+
+    const raw = await tabComplete(`/msg ${prefix}`);
+
+    const cleaned = raw
+      .map(x => String(x).replace(/[^A-Za-z0-9_]/g, ""))
+      .filter(x => x.length >= 3 && x.length <= 16);
+
+    return [...new Set(cleaned)];
+  });
+}
+
+/* ================== SIMPLE CHECK ================== */
 function checkNick(n) {
   const l = n.toLowerCase();
   if (l.includes("admin")) return "BAN";
-  if (l.includes("owner")) return "BAN";
   return "OK";
 }
 
-/* ================== AUTO SCAN ================== */
-async function startAutoScan() {
-  if (scanning) return;
-  scanning = true;
+/* ================== REPORT ================== */
+function buildReport(names) {
+  const ban = [];
+  const ok = [];
 
-  async function scan() {
-    if (!mcReady) return;
-
-    const names = ["admin123", "player1", "test"];
-
-    for (const n of names) {
-      if (checkNick(n) === "BAN") {
-        await tg.telegram.sendMessage(CHAT_ID, `🚫 ${n}\n/tban ${n} 1.1`);
-      }
-    }
+  for (const n of names) {
+    if (checkNick(n) === "BAN") ban.push(n);
+    else ok.push(n);
   }
 
-  await scan();
+  let out = `📦 SCAN RESULT\n\n`;
+  out += `👥 total: ${names.length}\n`;
+  out += `⛔ ban: ${ban.length}\n\n`;
 
-  autoScanTimer = setInterval(scan, AUTO_SCAN_MINUTES * 60000);
+  if (ban.length) {
+    out += `BAN LIST:\n`;
+    ban.forEach((n, i) => out += `${i + 1}) ${n}\n`);
+  }
+
+  return out;
 }
 
-/* ================== UI ================== */
+/* ================== UI (ТВОЙ СТИЛЬ) ================== */
 function menu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("🔎 Scan", "scan")],
-    [Markup.button.callback("📊 Status", "status")],
-    [Markup.button.callback("🔁 Auto now", "auto")]
+    [Markup.button.callback("🔎 scan", "scan")],
+    [Markup.button.callback("📊 status", "status")],
+    [Markup.button.callback("🔁 auto scan", "auto")]
   ]);
 }
 
 /* ================== COMMANDS ================== */
-tg.start((ctx) => ctx.reply("Bot online ✅", menu()));
+tg.start((ctx) => ctx.reply("Bot online", menu()));
 
 tg.action("status", async (ctx) => {
   await ctx.answerCbQuery();
   ctx.reply(
-    `MC: ${mcOnline ? "online" : "offline"}\nReady: ${mcReady}\nTAB: ${tabReady}`,
+    `MC: ${mc ? "connected" : "disconnected"}\nREADY: ${ready}`,
     menu()
   );
 });
 
+/* ================== FIXED SCAN (ВАЖНО) ================== */
 tg.action("scan", async (ctx) => {
   await ctx.answerCbQuery();
-  ctx.reply("Scanning...");
+
+  if (!ready) return ctx.reply("MC not ready", menu());
+
+  await ctx.reply("🔎 scanning...");
+
+  try {
+    const names = await scanTab("");
+    const report = buildReport(names);
+
+    await ctx.reply(report, menu());
+  } catch (e) {
+    await ctx.reply("scan error: " + e.message, menu());
+  }
 });
 
+/* ================== AUTO ================== */
 tg.action("auto", async (ctx) => {
   await ctx.answerCbQuery();
-  startAutoScan();
-  ctx.reply("Auto scan started");
+  ctx.reply("auto scan enabled", menu());
 });
 
 /* ================== START ================== */
-tg.launch().then(() => console.log("[TG] started"));
+tg.launch();
 connectMC();
