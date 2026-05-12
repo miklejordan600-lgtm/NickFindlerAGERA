@@ -470,150 +470,171 @@ let connecting = false;
 let autoScanPrimed = false;
 let lastSpawn = Date.now();
 
-/* ================== GLOBAL LOCK ================== */
-let currentConnectPromise = null;
-let destroyed = false;
-
 function scheduleReconnect(reason) {
-  if (reconnectTimer || connecting) return;
+  if (reconnectTimer) return;
 
   console.log("[MC] reconnect scheduled:", reason);
-
-  reconnectTimer = setTimeout(async () => {
+  reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-
-    try {
-      await connectMC();
-    } catch (e) {
-      console.log("[RECONNECT ERROR]", e?.message || e);
-    }
+    connectMC().catch((e) => {
+      console.log("[MC] reconnect error:", e?.message || e);
+    });
   }, 5000);
 }
 
+async function warmupTabReady(bot) {
+  for (let i = 1; i <= TAB_WARMUP_RETRIES; i++) {
+    try {
+      const r = await tabComplete(bot, "/msg a");
+      if (Array.isArray(r)) {
+        tabReady = true;
+        mcReady = true;
+        console.log(`[MC] TAB ready on try ${i}`);
+        return true;
+      }
+    } catch (e) {
+      console.log(`[MC] TAB warmup ${i}/${TAB_WARMUP_RETRIES} failed:`, e?.message || e);
+      await sleep(TAB_WARMUP_DELAY_MS);
+    }
+  }
+  return false;
+}
+
 async function connectMC() {
-  if (currentConnectPromise) {
-    return currentConnectPromise;
+  if (connecting) return;
+  connecting = true;
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
 
-  currentConnectPromise = (async () => {
-    try {
-      if (connecting) return;
-
-      connecting = true;
-      destroyed = false;
-
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-
-      if (mc) {
-        try {
-          destroyed = true;
-
-          mc.removeAllListeners();
-
-          if (mc._client) {
-            mc._client.removeAllListeners();
-
-            try {
-              mc._client.socket?.destroy?.();
-            } catch {}
-
-            try {
-              mc._client.end?.();
-            } catch {}
-          }
-
-          try {
-            mc.quit?.();
-          } catch {}
-
-        } catch {}
-      }
-
+  try {
+    if (mc) {
+      try {
+        if (typeof mc.quit === "function") mc.quit("reconnect");
+      } catch {}
+      try {
+        if (typeof mc.end === "function") mc.end();
+      } catch {}
+      try {
+        if (mc._client && typeof mc._client.end === "function") mc._client.end();
+      } catch {}
       mc = null;
+    }
 
+    mcReady = false;
+    tabReady = false;
+    mcOnline = false;
+    mcLastError = "";
+    loginSent = false;
+    registerSent = false;
+    autoScanPrimed = false;
+
+    const ep = await resolveMcEndpoint(MC_HOST, MC_PORT);
+
+    console.log("[MC DEBUG]", {
+      inputHost: MC_HOST,
+      inputPort: MC_PORT,
+      resolvedHost: ep.host,
+      resolvedPort: ep.port,
+      via: ep.via,
+      version: MC_VERSION,
+      user: MC_USER,
+    });
+
+    mc = mineflayer.createBot({
+      host: ep.host,
+      port: ep.port,
+      username: MC_USER,
+      version: MC_VERSION,
+      viewDistance: 1,
+    });
+
+    mc._client.setMaxListeners(50);
+
+    mc.on("login", () => {
+      disableChunkParsing(mc);
+      mcOnline = true;
+      mcReady = false;
+      mcLastError = "";
+      console.log("[MC] login");
+    });
+
+    mc.on("spawn", async () => {
+      lastSpawn = Date.now();
+      console.log("[MC] spawn");
+      await sleep(READY_AFTER_MS);
+
+      const ok = await warmupTabReady(mc);
+      if (!ok) {
+        mcReady = false;
+        tabReady = false;
+        mcLastError = "TAB warmup failed after spawn";
+        console.log("[MC] TAB warmup failed, reconnecting...");
+        scheduleReconnect("tab_warmup_failed");
+        return;
+      }
+
+      primeAutoScan();
+      console.log("[MC] READY via SPAWN+TAB");
+    });
+
+    mc.on("messagestr", (msg) => {
+      const m = String(msg).toLowerCase();
+
+      if (MC_PASSWORD && !loginSent && m.includes("login")) {
+        loginSent = true;
+        setTimeout(() => {
+          try {
+            mc?.chat?.(`/login ${MC_PASSWORD}`);
+          } catch (e) {
+            console.log("[MC] login command error:", e?.message || e);
+          }
+        }, 1500);
+      }
+
+      if (MC_PASSWORD && !registerSent && m.includes("register")) {
+        registerSent = true;
+        setTimeout(() => {
+          try {
+            mc?.chat?.(`/register ${MC_PASSWORD} ${MC_PASSWORD}`);
+          } catch (e) {
+            console.log("[MC] register command error:", e?.message || e);
+          }
+        }, 1500);
+      }
+    });
+
+    const onDisconnect = (reason) => {
       mcReady = false;
       tabReady = false;
       mcOnline = false;
+      mcLastError = reason;
+      loginSent = false;
+      registerSent = false;
+      console.log("[MC] disconnected:", reason);
+      scheduleReconnect(reason);
+    };
 
-      const ep = await resolveMcEndpoint(MC_HOST, MC_PORT);
-
-      console.log("[MC CONNECT]", ep);
-
-      mc = mineflayer.createBot({
-        host: ep.host,
-        port: ep.port,
-        username: MC_USER,
-        version: MC_VERSION,
-        hideErrors: true,
-        checkTimeoutInterval: 30000,
-      });
-
-      mc._client.setMaxListeners(100);
-
-      mc.once("login", () => {
-        if (destroyed) return;
-
-        mcOnline = true;
-
-        console.log("[MC] login");
-      });
-
-      mc.once("spawn", async () => {
-        if (destroyed) return;
-
-        console.log("[MC] spawn");
-
-        await sleep(2000);
-
-        try {
-          await tabComplete(mc, "/msg a");
-
-          tabReady = true;
-          mcReady = true;
-
-          console.log("[MC] READY");
-        } catch (e) {
-          console.log("[MC] TAB FAIL", e?.message || e);
-
-          scheduleReconnect("tab_fail");
-        }
-      });
-
-      const disconnect = (reason) => {
-        if (destroyed) return;
-
-        destroyed = true;
-
-        mcReady = false;
-        tabReady = false;
-        mcOnline = false;
-
-        console.log("[MC] disconnected:", reason);
-
-        scheduleReconnect(reason);
-      };
-
-      mc.once("end", () => disconnect("end"));
-
-      mc.once("kicked", (r) => {
-        disconnect("kicked: " + r);
-      });
-
-      mc.once("error", (e) => {
-        disconnect(e?.message || e);
-      });
-
-    } finally {
-      connecting = false;
-      currentConnectPromise = null;
-    }
-  })();
-
-  return currentConnectPromise;
+    mc.on("end", () => onDisconnect("end"));
+    mc.on("kicked", (r) => onDisconnect("kicked: " + String(r)));
+    mc.on("error", (e) => {
+      const msg = e?.stack || e?.message || String(e);
+      onDisconnect("error: " + msg);
+    });
+  } catch (e) {
+    mcLastError = "createBot/connect failed: " + String(e?.message || e);
+    console.log("[MC]", mcLastError);
+    scheduleReconnect("createBot");
+  } finally {
+    connecting = false;
+  }
 }
+
+connectMC().catch((e) => {
+  console.log("[MC] connect error:", e?.message || e);
+});
 
 /* ================== SCAN HELPERS ================== */
 function clean(s) {
@@ -1186,6 +1207,24 @@ function scheduleNextAutoScan(delayMs = AUTO_SCAN_MINUTES * 60 * 1000) {
   }, safeDelay);
 }
 
+function primeAutoScan() {
+  if (!AUTO_SCAN || autoScanPrimed) return;
+
+  autoScanPrimed = true;
+  scheduleNextAutoScan(AUTO_SCAN_MINUTES * 60 * 1000);
+
+  setTimeout(() => {
+    runAutoScan("ready").catch((e) => {
+      autoScanLastResult = "error";
+      autoScanLastError = String(e?.message || e);
+    });
+  }, STARTUP_SCAN_DELAY_MS);
+}
+
+if (AUTO_SCAN) {
+  scheduleNextAutoScan(STARTUP_SCAN_DELAY_MS);
+}
+
 /* ================== WATCHDOG ================== */
 setInterval(() => {
   const deadFor = Date.now() - lastSpawn;
@@ -1205,14 +1244,9 @@ setInterval(() => {
 (async () => {
   await launchTelegramSafely();
 
-  console.log("[SYSTEM] TG READY");
+  console.log("[SYSTEM] Telegram ready");
 
-  await connectMC();
-
-  setTimeout(() => {
-    if (AUTO_SCAN) {
-      runAutoScan("startup");
-      scheduleNextAutoScan();
-    }
-  }, 15000);
+  if (!mc) {
+    await connectMC();
+  }
 })();
