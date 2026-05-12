@@ -27,10 +27,10 @@ const AUTO_SCAN_MINUTES = Number(process.env.AUTO_SCAN_MINUTES || 10);
 const SCAN_DELAY_MS = Number(process.env.SCAN_DELAY_MS || 200);
 const AUTO_PREFIXES = (process.env.AUTO_PREFIXES || "").trim();
 
-const READY_AFTER_MS = Number(process.env.READY_AFTER_MS || 1500);
+const READY_AFTER_MS = Number(process.env.READY_AFTER_MS || 4000);
 const STARTUP_SCAN_DELAY_MS = Number(process.env.STARTUP_SCAN_DELAY_MS || 8000);
 const TAB_WARMUP_RETRIES = Number(process.env.TAB_WARMUP_RETRIES || 4);
-const TAB_WARMUP_DELAY_MS = Number(process.env.TAB_WARMUP_DELAY_MS || 2000);
+const TAB_WARMUP_DELAY_MS = Number(process.env.TAB_WARMUP_DELAY_MS || 3500);
 const AUTO_RETRY_ON_FAIL_MINUTES = Number(process.env.AUTO_RETRY_ON_FAIL_MINUTES || 2);
 const MAX_PREFIX_ERRORS_IN_REPORT = Number(process.env.MAX_PREFIX_ERRORS_IN_REPORT || 8);
 
@@ -231,52 +231,19 @@ function checkNick(name) {
 }
 
 /* ================== REPORT ================== */
-function splitText(t, max = 3500) {
-  const parts = [];
-  let buf = "";
+function buildBanButtons(banList = []) {
+  const rows = [];
 
-  for (const line of t.split("\n")) {
-    if ((buf + line + "\n").length > max) {
-      parts.push(buf);
-      buf = "";
-    }
-    buf += line + "\n";
+  for (const x of banList.slice(0, 80)) {
+    rows.push([
+      Markup.button.copy(
+        `⛔ ${x.nick.slice(0, 16)}`,
+        `/ban ${x.nick} 1.1`
+      ),
+    ]);
   }
 
-  if (buf) parts.push(buf);
-  return parts;
-}
-
-async function sendChunksReply(ctx, text, extra) {
-  for (const p of splitText(text)) {
-    if (p.trim()) {
-      await ctx.reply(p, extra);
-    }
-  }
-}
-
-async function sendChunksChat(chatId, text, extra) {
-  for (const p of splitText(text)) {
-    if (!p.trim()) continue;
-    const ok = await safeSend(chatId, p, extra);
-    if (!ok) throw new Error("TG_SEND_FAILED");
-  }
-}
-
-async function sendChunksChatHtml(chatId, html) {
-  for (const p of splitText(html)) {
-    if (!p.trim()) continue;
-
-    const ok = await safeSend(chatId, p, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    });
-    if (ok) continue;
-
-    const fallback = p.replace(/<[^>]+>/g, "");
-    const plainOk = await safeSend(chatId, fallback);
-    if (!plainOk) throw new Error("TG_SEND_FAILED");
-  }
+  return rows;
 }
 
 function report(title, names, meta = {}) {
@@ -285,30 +252,43 @@ function report(title, names, meta = {}) {
 
   for (const nick of names) {
     const [s, r] = checkNick(nick);
-    if (s === "BAN") ban.push({ nick, r });
-    else if (s === "REVIEW") rev.push({ nick, r });
+
+    if (s === "BAN") {
+      ban.push({ nick, r });
+    } else if (s === "REVIEW") {
+      rev.push({ nick, r });
+    }
   }
 
   let out = `📦 ${title}\n`;
   out += `👥 Найдено ников: ${names.length}\n`;
-  if (meta.okPrefixes != null || meta.failedPrefixes != null) {
+
+  if (
+    meta.okPrefixes != null ||
+    meta.failedPrefixes != null
+  ) {
     out += `🧩 Префиксы: ok=${meta.okPrefixes || 0}, fail=${meta.failedPrefixes || 0}\n`;
   }
+
   out += "\n";
 
   if (ban.length) {
     out += `⛔ BAN (${ban.length}):\n`;
+
     ban.forEach((x, i) => {
       out += `${i + 1}) ${x.nick} -> ${x.r.join("; ")}\n`;
     });
+
     out += "\n";
   }
 
   if (rev.length) {
     out += `🟡 REVIEW (${rev.length}):\n`;
+
     rev.forEach((x, i) => {
       out += `${i + 1}) ${x.nick} -> ${x.r.join("; ")}\n`;
     });
+
     out += "\n";
   }
 
@@ -318,7 +298,11 @@ function report(title, names, meta = {}) {
 
   if (meta.errors?.length) {
     out += `\n⚠️ Ошибки префиксов (${meta.errors.length}):\n`;
-    for (const err of meta.errors.slice(0, MAX_PREFIX_ERRORS_IN_REPORT)) {
+
+    for (const err of meta.errors.slice(
+      0,
+      MAX_PREFIX_ERRORS_IN_REPORT
+    )) {
       out += `• ${err}\n`;
     }
   }
@@ -329,6 +313,7 @@ function report(title, names, meta = {}) {
     rev: rev.length,
     reviewNicks: rev.map((x) => x.nick),
     banNicks: ban.map((x) => x.nick),
+    buttons: buildBanButtons(ban),
   };
 }
 
@@ -386,7 +371,18 @@ async function resolveMcEndpoint(host, port) {
 }
 
 /* ================== TAB COMPLETE ================== */
-function tabComplete(bot, text) {
+let tabQueue = Promise.resolve();
+
+function queuedTabComplete(bot, text) {
+  tabQueue = tabQueue.then(async () => {
+    await sleep(350); // защита от антиспама tab-complete
+    return rawTabComplete(bot, text);
+  });
+
+  return tabQueue;
+}
+
+function rawTabComplete(bot, text) {
   return new Promise((res, rej) => {
     if (!bot?._client) {
       rej(new Error("CLIENT_NOT_READY"));
@@ -395,25 +391,35 @@ function tabComplete(bot, text) {
 
     const c = bot._client;
 
-    const to = setTimeout(() => {
+    const timeout = setTimeout(() => {
       cleanup();
       rej(new Error("TAB_TIMEOUT"));
-    }, 2500);
+    }, 5000); // было 2500
 
     const on = (p) => {
       cleanup();
-      const matches =
-        p?.matches?.map((x) =>
-          typeof x === "string" ? x : x.text || x.match || ""
-        ) || [];
-      res(matches);
+
+      try {
+        const matches =
+          p?.matches?.map((x) =>
+            typeof x === "string"
+              ? x
+              : x.text || x.match || ""
+          ) || [];
+
+        res(matches);
+      } catch (e) {
+        rej(e);
+      }
     };
 
     function cleanup() {
-      clearTimeout(to);
+      clearTimeout(timeout);
+
       try {
         c.removeListener("tab_complete", on);
       } catch {}
+
       try {
         c.removeListener("tab_complete_response", on);
       } catch {}
@@ -425,14 +431,22 @@ function tabComplete(bot, text) {
 
       c.write("tab_complete", {
         text,
-        assumeCommand: true,
-        lookedAtBlock: { x: 0, y: 0, z: 0 },
+        assumeCommand: false,
+        lookedAtBlock: {
+          x: 0,
+          y: 0,
+          z: 0,
+        },
       });
     } catch (e) {
       cleanup();
       rej(e);
     }
   });
+}
+
+function tabComplete(bot, text) {
+  return queuedTabComplete(bot, text);
 }
 
 /* ================== MINEFLAYER ================== */
@@ -620,18 +634,42 @@ async function byPrefix(prefix) {
     throw new Error("MC_OR_TAB_NOT_READY");
   }
 
-  const raw = await tabComplete(mc, `/msg ${prefix}`);
   const pref = clean(prefix).toLowerCase();
+
+  let raw = [];
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      raw = await tabComplete(mc, `/msg ${prefix}`);
+      break;
+    } catch (e) {
+      const msg = String(e?.message || e);
+
+      console.log(`[TAB RETRY ${attempt}] ${prefix} -> ${msg}`);
+
+      if (attempt >= 3) {
+        throw e;
+      }
+
+      await sleep(1200);
+    }
+  }
 
   const result = raw
     .map(clean)
     .filter((n) => n.length >= 3 && n.length <= 16)
-    .filter((n) => (pref ? n.toLowerCase().startsWith(pref) : true));
+    .filter((n) =>
+      pref
+        ? n.toLowerCase().startsWith(pref)
+        : true
+    );
 
-  console.log(`[TAB] prefix=${prefix} raw=${raw.length} filtered=${result.length}`);
+  console.log(
+    `[TAB] prefix=${prefix} raw=${raw.length} filtered=${result.length}`
+  );
+
   return [...new Set(result)];
 }
-
 function prefixes() {
   if (AUTO_PREFIXES) {
     return AUTO_PREFIXES
@@ -895,6 +933,13 @@ tg.command(
     };
 
     await sendChunksReply(c, r.out);
+
+if (r.buttons?.length) {
+  await c.reply(
+    "⛔ Быстрые баны:",
+    Markup.inlineKeyboard(r.buttons)
+  );
+}
     await c.reply("✅ Готово. Можно нажать AI по последнему скану.", menuKeyboard());
   })
 );
@@ -952,7 +997,15 @@ tg.action(
     };
 
     await sendChunksReply(ctx, r.out);
-    await ctx.reply("✅ Готово. Нажми AI по последнему скану.", menuKeyboard());
+
+if (r.buttons?.length) {
+  await ctx.reply(
+    "⛔ Быстрые баны:",
+    Markup.inlineKeyboard(r.buttons)
+  );
+}
+
+await ctx.reply("✅ Готово. Нажми AI по последнему скану.", menuKeyboard());
   })
 );
 
