@@ -3,6 +3,17 @@ import mineflayer from "mineflayer";
 import { Telegraf, Markup } from "telegraf";
 import { resolveSrv } from "dns/promises";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import process from "process";
+
+process.setMaxListeners(50);
+
+process.on("unhandledRejection", (err) => {
+  console.log("[UNHANDLED]", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.log("[CRASH]", err);
+});
 
 /* ================== ENV ================== */
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -457,6 +468,7 @@ let registerSent = false;
 let reconnectTimer = null;
 let connecting = false;
 let autoScanPrimed = false;
+let lastSpawn = Date.now();
 
 function scheduleReconnect(reason) {
   if (reconnectTimer) return;
@@ -550,6 +562,7 @@ async function connectMC() {
     });
 
     mc.on("spawn", async () => {
+      lastSpawn = Date.now();
       console.log("[MC] spawn");
       await sleep(READY_AFTER_MS);
 
@@ -1213,8 +1226,6 @@ if (AUTO_SCAN) {
 }
 
 /* ================== WATCHDOG ================== */
-let lastSpawn = Date.now();
-
 setInterval(() => {
   const deadFor = Date.now() - lastSpawn;
 
