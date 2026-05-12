@@ -3,6 +3,17 @@ import mineflayer from "mineflayer";
 import { Telegraf, Markup } from "telegraf";
 import { resolveSrv } from "dns/promises";
 import http from "http";
+import process from "process";
+
+process.setMaxListeners(50);
+
+process.on("unhandledRejection", (err) => {
+  console.log("[UNHANDLED]", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.log("[CRASH]", err);
+});
 
 /* ================== ENV ================== */
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -64,12 +75,15 @@ async function connectMC() {
       version: MC_VERSION,
     });
 
+    mc._client.setMaxListeners(50);
+
     mc.on("login", () => {
       mcOnline = true;
       console.log("[MC] login");
     });
 
     mc.on("spawn", async () => {
+      lastSpawn = Date.now();
       setTimeout(() => {
         mcReady = true;
         tabReady = true;
@@ -80,6 +94,18 @@ async function connectMC() {
     mc.on("end", () => scheduleReconnect("end"));
     mc.on("kicked", (r) => scheduleReconnect("kicked"));
     mc.on("error", (e) => scheduleReconnect(e.message));
+
+    // Disable broken packets
+    try {
+      mc._client.on("packet", (data, meta) => {
+        if (
+          meta?.name === "sound_effect" ||
+          meta?.name === "named_sound_effect"
+        ) {
+          return;
+        }
+      });
+    } catch {}
 
   } finally {
     connecting = false;
@@ -197,34 +223,61 @@ tg.command("scan", async (ctx) => {
   );
 });
 
-/* ================== SELF HEAL ================== */
-function selfHeal() {
-  process.on("uncaughtException", (e) => {
-    console.log("[CRASH]", e);
-  });
+/* ================== TELEGRAM LAUNCH ================== */
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-  process.on("unhandledRejection", (e) => {
-    console.log("[PROMISE ERROR]", e);
-  });
+async function launchTelegramSafely() {
+  while (true) {
+    try {
+      console.log("[TG] starting polling...");
 
-  setInterval(() => {
-    if (!mcOnline || !mcReady) {
-      console.log("[WATCHDOG] MC reconnect");
-      connectMC();
+      await tg.launch({
+        dropPendingUpdates: true,
+        allowedUpdates: ["message", "callback_query"],
+      });
+
+      console.log("[TG] started");
+      return;
+    } catch (e) {
+      console.log("[TG ERROR]", e?.message || e);
+
+      await sleep(10000);
     }
-  }, 30000);
+  }
+}
+
+/* ================== WATCHDOG ================== */
+let lastSpawn = Date.now();
+
+function startWatchdog() {
+  setInterval(() => {
+    const deadFor = Date.now() - lastSpawn;
+
+    if (
+      mcOnline &&
+      deadFor > 120000 &&
+      !connecting &&
+      !reconnectTimer
+    ) {
+      console.log("[WATCHDOG] frozen client reconnect");
+      scheduleReconnect("watchdog_frozen");
+    }
+  }, 60000);
 }
 
 /* ================== START ================== */
 (async () => {
-  console.log("[SYSTEM] starting...");
+  await launchTelegramSafely();
 
-  selfHeal();
+  console.log("[SYSTEM] Telegram ready");
 
-  await connectMC();
+  if (!mc) {
+    await connectMC();
+  }
 
-  tg.launch();
-  console.log("[SYSTEM] Telegram started");
+  startWatchdog();
 
   http.createServer((req, res) => res.end("OK"))
     .listen(process.env.PORT || 3000);
