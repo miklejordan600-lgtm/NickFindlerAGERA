@@ -2,10 +2,7 @@ import fs from "fs";
 import mineflayer from "mineflayer";
 import { Telegraf, Markup } from "telegraf";
 import { resolveSrv } from "dns/promises";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import process from "process";
-
-process.setMaxListeners(50);
 
 /* ================== ENV ================== */
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -19,12 +16,11 @@ const MC_PASSWORD = process.env.MC_PASSWORD;
 
 const AUTO_SCAN = (process.env.AUTO_SCAN || "1") === "1";
 const AUTO_SCAN_MINUTES = Number(process.env.AUTO_SCAN_MINUTES || 10);
-const SCAN_DELAY_MS = Number(process.env.SCAN_DELAY_MS || 200);
 
 /* ================== BOT ================== */
 const tg = new Telegraf(BOT_TOKEN);
 
-/* ================== STATE MACHINE ================== */
+/* ================== STATE ================== */
 let mc = null;
 
 let state = {
@@ -41,7 +37,7 @@ let tabQueue = Promise.resolve();
 /* ================== UTILS ================== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ================== CLEAN BOT ================== */
+/* ================== MC DESTROY ================== */
 function destroyMC() {
   try {
     if (!mc) return;
@@ -60,7 +56,7 @@ function destroyMC() {
   } catch {}
 }
 
-/* ================== RECONNECT (SAFE) ================== */
+/* ================== RECONNECT ================== */
 function scheduleReconnect(reason) {
   if (state.reconnecting) return;
 
@@ -79,22 +75,22 @@ function scheduleReconnect(reason) {
   console.log("[MC] reconnect:", reason);
 }
 
-/* ================== TAB QUEUE (ANTI-LAG) ================== */
+/* ================== SAFE TAB QUEUE ================== */
 function tabCompleteSafe(text) {
   return new Promise((resolve, reject) => {
     if (!mc) return reject("NO_MC");
 
     tabQueue = tabQueue.then(() => {
       return new Promise((res, rej) => {
-        const t = setTimeout(() => rej("TAB_TIMEOUT"), 3000);
+        const t = setTimeout(() => rej("TAB_TIMEOUT"), 2500);
 
         mc._client.once("tab_complete", (p) => {
           clearTimeout(t);
 
-          const matches =
+          const out =
             p?.matches?.map(x => (typeof x === "string" ? x : x.text)) || [];
 
-          res(matches);
+          res(out);
         });
 
         mc._client.write("tab_complete", {
@@ -144,11 +140,6 @@ async function connectMC() {
       scheduleReconnect(r);
     };
 
-    mc.once("login", () => {
-      if (session !== state.session) return;
-      console.log("[MC] login");
-    });
-
     mc.once("spawn", async () => {
       if (session !== state.session) return;
       if (state.spawnDone) return;
@@ -196,10 +187,9 @@ async function connectMC() {
   }
 }
 
-/* ================== SIMPLE NICK CHECK ================== */
+/* ================== SIMPLE CHECK ================== */
 function checkNick(n) {
-  const l = n.toLowerCase();
-  if (l.includes("admin")) return "BAN";
+  if (n.toLowerCase().includes("admin")) return "BAN";
   return "OK";
 }
 
@@ -221,7 +211,25 @@ async function autoScan() {
   autoScanTimer = setTimeout(autoScan, AUTO_SCAN_MINUTES * 60000);
 }
 
-/* ================== BUTTON HANDLER ================== */
+/* ================== TELEGRAM SAFE START ================== */
+async function launchTelegramSafe() {
+  while (true) {
+    try {
+      console.log("[TG] starting...");
+      await tg.launch({
+        dropPendingUpdates: true,
+        allowedUpdates: ["message", "callback_query"],
+      });
+      console.log("[TG] started");
+      return;
+    } catch (e) {
+      console.log("[TG ERROR]", e?.message || e);
+      await sleep(5000);
+    }
+  }
+}
+
+/* ================== BUTTON CALLBACK ================== */
 tg.action(/^tban_(.+)$/, async (ctx) => {
   const nick = ctx.match[1];
 
@@ -233,5 +241,5 @@ tg.action(/^tban_(.+)$/, async (ctx) => {
 });
 
 /* ================== START ================== */
-tg.launch();
+launchTelegramSafe();
 connectMC();
