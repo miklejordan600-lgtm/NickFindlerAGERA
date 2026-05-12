@@ -7,20 +7,11 @@ import process from "process";
 
 process.setMaxListeners(50);
 
-process.on("unhandledRejection", (err) => {
-  console.log("[UNHANDLED]", err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.log("[CRASH]", err);
-});
-
 /* ================== ENV ================== */
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-const PING_USER_ID = process.env.PING_USER_ID ? Number(process.env.PING_USER_ID) : null;
 
-const MC_HOST = (process.env.MC_HOST || "").trim();
+const MC_HOST = process.env.MC_HOST;
 const MC_PORT = Number(process.env.MC_PORT || 25565);
 const MC_USER = process.env.MC_USER;
 const MC_VERSION = process.env.MC_VERSION || "1.8.9";
@@ -30,10 +21,10 @@ const AUTO_SCAN = (process.env.AUTO_SCAN || "1") === "1";
 const AUTO_SCAN_MINUTES = Number(process.env.AUTO_SCAN_MINUTES || 10);
 const SCAN_DELAY_MS = Number(process.env.SCAN_DELAY_MS || 200);
 
-const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
-const AI_ENABLED = (process.env.AI_ENABLED || "1") === "1";
+/* ================== BOT ================== */
+const tg = new Telegraf(BOT_TOKEN);
 
-/* ================== STATE ENGINE ================== */
+/* ================== STATE MACHINE ================== */
 let mc = null;
 
 let state = {
@@ -47,16 +38,10 @@ let reconnectTimer = null;
 let autoScanTimer = null;
 let tabQueue = Promise.resolve();
 
-/* ================== TELEGRAM ================== */
-const tg = new Telegraf(BOT_TOKEN);
+/* ================== UTILS ================== */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function safeSend(chatId, text, extra) {
-  return tg.telegram.sendMessage(chatId, text, extra).catch(() => {});
-}
-
-/* ================== DESTROY ================== */
+/* ================== CLEAN BOT ================== */
 function destroyMC() {
   try {
     if (!mc) return;
@@ -75,7 +60,7 @@ function destroyMC() {
   } catch {}
 }
 
-/* ================== RECONNECT ================== */
+/* ================== RECONNECT (SAFE) ================== */
 function scheduleReconnect(reason) {
   if (state.reconnecting) return;
 
@@ -94,28 +79,28 @@ function scheduleReconnect(reason) {
   console.log("[MC] reconnect:", reason);
 }
 
-/* ================== TAB SAFE ================== */
+/* ================== TAB QUEUE (ANTI-LAG) ================== */
 function tabCompleteSafe(text) {
   return new Promise((resolve, reject) => {
     if (!mc) return reject("NO_MC");
 
     tabQueue = tabQueue.then(() => {
       return new Promise((res, rej) => {
-        const t = setTimeout(() => rej("TAB_TIMEOUT"), 2500);
+        const t = setTimeout(() => rej("TAB_TIMEOUT"), 3000);
 
         mc._client.once("tab_complete", (p) => {
           clearTimeout(t);
 
-          const out =
-            p?.matches?.map((x) => (typeof x === "string" ? x : x.text)) || [];
+          const matches =
+            p?.matches?.map(x => (typeof x === "string" ? x : x.text)) || [];
 
-          res(out);
+          res(matches);
         });
 
         mc._client.write("tab_complete", {
           text,
           assumeCommand: true,
-          lookedAtBlock: { x: 0, y: 0, z: 0 },
+          lookedAtBlock: { x: 0, y: 0, z: 0 }
         });
       });
     });
@@ -124,7 +109,7 @@ function tabCompleteSafe(text) {
   });
 }
 
-/* ================== CONNECT ================== */
+/* ================== CONNECT MC ================== */
 async function connectMC() {
   const session = ++state.session;
 
@@ -148,13 +133,21 @@ async function connectMC() {
       version: MC_VERSION,
     });
 
+    mc._client.setMaxListeners(100);
+
     let dead = false;
 
     const kill = (r) => {
       if (dead || session !== state.session) return;
       dead = true;
+      state.status = "DEAD";
       scheduleReconnect(r);
     };
+
+    mc.once("login", () => {
+      if (session !== state.session) return;
+      console.log("[MC] login");
+    });
 
     mc.once("spawn", async () => {
       if (session !== state.session) return;
@@ -162,13 +155,26 @@ async function connectMC() {
 
       state.spawnDone = true;
 
-      setTimeout(() => {
+      console.log("[MC] spawn");
+
+      await sleep(1500);
+
+      try {
+        const test = await tabCompleteSafe("/msg a");
+        if (!Array.isArray(test)) throw new Error("TAB_FAIL");
+
         state.status = "READY";
         console.log("[MC] READY");
-      }, 1500);
+
+        if (AUTO_SCAN) autoScan();
+      } catch {
+        kill("tab_fail");
+      }
     });
 
     mc.on("messagestr", (m) => {
+      if (session !== state.session) return;
+
       const msg = String(m).toLowerCase();
 
       if (MC_PASSWORD && msg.includes("login")) {
@@ -185,17 +191,15 @@ async function connectMC() {
     mc.once("error", (e) => kill(e?.message));
 
   } catch (e) {
+    console.log("[MC] connect error:", e?.message || e);
     scheduleReconnect("connect_error");
   }
 }
 
-/* ================== NICK CHECK ================== */
-function checkNick(nick) {
-  const lower = nick.toLowerCase();
-
-  if (lower.includes("admin")) return "BAN";
-  if (lower.includes("mod")) return "REVIEW";
-
+/* ================== SIMPLE NICK CHECK ================== */
+function checkNick(n) {
+  const l = n.toLowerCase();
+  if (l.includes("admin")) return "BAN";
   return "OK";
 }
 
@@ -203,26 +207,21 @@ function checkNick(nick) {
 async function autoScan() {
   if (!mc || state.status !== "READY") return;
 
-  const names = ["test1", "admin123", "player"];
-
-  let bans = [];
+  const names = ["admin123", "player1", "test"];
 
   for (const n of names) {
     if (checkNick(n) === "BAN") {
-      bans.push(n);
-    }
-  }
-
-  if (bans.length) {
-    for (const n of bans) {
-      await safeSend(CHAT_ID, `🚫 ${n}\n/tban ${n} 1.1`);
+      await tg.telegram.sendMessage(
+        CHAT_ID,
+        `🚫 ${n}\n/tban ${n} 1.1`
+      );
     }
   }
 
   autoScanTimer = setTimeout(autoScan, AUTO_SCAN_MINUTES * 60000);
 }
 
-/* ================== BUTTON ================== */
+/* ================== BUTTON HANDLER ================== */
 tg.action(/^tban_(.+)$/, async (ctx) => {
   const nick = ctx.match[1];
 
@@ -235,6 +234,4 @@ tg.action(/^tban_(.+)$/, async (ctx) => {
 
 /* ================== START ================== */
 tg.launch();
-
 connectMC();
-autoScan();
